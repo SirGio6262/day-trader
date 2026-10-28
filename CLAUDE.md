@@ -94,3 +94,15 @@ skill names, or nothing.
 
 This repo's cloud environment cannot reach any of these hosts unless its
 network policy allows them. The daily run happens on Sergey's own machine.
+
+## Decisions (do not reopen without Sergey saying so)
+
+- **2026-10-28, stocks only, no crypto.** Considered and rejected: the pack
+  is built around the NYSE session (opening range from 9:30, 78-bar
+  replays, the NYSE calendar, stock-only universe, `place_stock_order`
+  only); Alpaca's crypto fees (0.15 % maker, 0.25 % taker) cost about 0.3 R
+  per trade against a 0.1 R gate; half of Bitcoin's daily variance sits in
+  US hours anyway and weekend volatility runs at 0.6 of weekdays. Keep
+  `"allow_crypto": false` and `"allow_options": false`. A crypto adaptation,
+  if ever, is a separate branch and only after the stock version passes the
+  journal gate.
