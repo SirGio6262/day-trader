@@ -8,3 +8,6 @@ trader/
 .DS_Store
 __pycache__/
 *.pyc
+
+# Local Claude Code settings (copy claude-settings.example.json here)
+.claude/settings.json

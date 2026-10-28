@@ -1,0 +1,32 @@
+{
+  "_comment": "Copy this file to .claude/settings.json (that path is gitignored on purpose). Order tools on ask, batch and options tools denied, read-only tools and the skill scripts allowed.",
+  "permissions": {
+    "allow": [
+      "Bash(python3 .claude/skills/*)",
+      "Bash(python3 */.claude/skills/*)",
+      "Bash(python3 -m unittest *)",
+      "mcp__alpaca__get_account_info",
+      "mcp__alpaca__get_all_positions",
+      "mcp__alpaca__get_open_position",
+      "mcp__alpaca__get_orders",
+      "mcp__alpaca__get_clock",
+      "mcp__alpaca__get_stock_snapshot",
+      "mcp__alpaca__get_stock_latest_quote"
+    ],
+    "ask": [
+      "mcp__alpaca__place_stock_order",
+      "mcp__alpaca__cancel_order_by_id",
+      "mcp__alpaca__replace_order_by_id",
+      "mcp__alpaca__close_position",
+      "mcp__alpaca__update_account_config"
+    ],
+    "deny": [
+      "mcp__alpaca__place_option_order",
+      "mcp__alpaca__place_crypto_order",
+      "mcp__alpaca__close_all_positions",
+      "mcp__alpaca__cancel_all_orders",
+      "mcp__alpaca__exercise_options_position",
+      "mcp__alpaca__do_not_exercise_options_position"
+    ]
+  }
+}
