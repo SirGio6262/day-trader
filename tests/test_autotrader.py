@@ -148,8 +148,8 @@ class RuleTest(unittest.TestCase):
         loose = dict(cfg, max_loss_per_trade_usd=5000, max_order_usd=3000)
         qty, limit, _ = at.size_order(loose, 364.18, 358.32, 5000)
         self.assertEqual((qty, limit), (8, "max order"))
-        qty, limit, _ = at.size_order(cfg, 364.18, 358.32, 1000)   # little cash: 900 / 364 = 2
-        self.assertEqual((qty, limit), (2, "cash after the buffer"))
+        qty, limit, _ = at.size_order(cfg, 364.18, 358.32, 1000)   # cash 1000 minus the 10% budget buffer 500 = 1 share
+        self.assertEqual((qty, limit), (1, "cash after the buffer"))
 
 
 class RiskTest(unittest.TestCase):
