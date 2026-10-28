@@ -1,0 +1,10 @@
+# Working folder the trader skills write to (watchlists, plans, orders, prices,
+# and config.json with your SEC user agent). Keep it out of git.
+trader/
+
+# Local Claude Code state
+.claude/settings.local.json
+
+.DS_Store
+__pycache__/
+*.pyc
