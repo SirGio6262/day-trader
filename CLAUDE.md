@@ -93,7 +93,7 @@ and `trader/STOP` is the kill switch. See `autotrader/README.md`.
   append-only logs. Never delete `trader/state/broker.json`: it is the record.
 - `.mcp.json`: the Alpaca MCP server for Claude Code, keys from the environment.
 - `claude-settings.example.json`: copy it to `.claude/settings.json` (gitignored). Order tools on ask, batch and option tools denied.
-- `autotrader/`: the executor, its systemd unit, requirements and README.
+- `autotrader/`: the executor, its systemd unit, requirements, README and the Russian step-by-step `SETUP.ru.md`.
 - `tests/`: `python3 -m unittest discover -s tests` must pass before a push.
 
 ## Data sources and their limits
