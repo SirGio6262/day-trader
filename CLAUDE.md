@@ -72,6 +72,18 @@ of running it before the budget step.
    `max_daily_loss_usd` are the only levers, and they move after a gate
    pass, never after a good week.
 
+## The autotrader (unattended execution)
+
+Sergey works 06:00 to 18:00 New York, the whole session, so the daily run
+above is executed by `autotrader/autotrader.py` on a VPS, not by a person in
+a chat. It trades the same opening-range rule on a fixed symbol list through
+Alpaca with bracket orders, applies the same config limits in code, is flat
+by 15:55, and writes trader-broker's log shape so the journal works. Claude's
+job moves to the evening: read `journal.py report`, explain what changed,
+propose rule changes as config edits, never as live interventions. The hard
+rules above still hold: the autotrader is paper until the journal says GO,
+and `trader/STOP` is the kill switch. See `autotrader/README.md`.
+
 ## Files
 
 - `trader/config.json` (gitignored): budget, limits, the `journal` gate,
@@ -81,6 +93,7 @@ of running it before the budget step.
   append-only logs. Never delete `trader/state/broker.json`: it is the record.
 - `.mcp.json`: the Alpaca MCP server for Claude Code, keys from the environment.
 - `claude-settings.example.json`: copy it to `.claude/settings.json` (gitignored). Order tools on ask, batch and option tools denied.
+- `autotrader/`: the executor, its systemd unit, requirements and README.
 - `tests/`: `python3 -m unittest discover -s tests` must pass before a push.
 
 ## Data sources and their limits
@@ -106,3 +119,8 @@ network policy allows them. The daily run happens on Sergey's own machine.
   `"allow_crypto": false` and `"allow_options": false`. A crypto adaptation,
   if ever, is a separate branch and only after the stock version passes the
   journal gate.
+- **2026-10-28, unattended execution on a VPS.** Sergey cannot watch the
+  session, so orders are placed by `autotrader/autotrader.py`, a
+  deterministic Python process, not by Claude. Claude never places orders
+  and never runs the executor from a chat. alpaca-py is the one dependency,
+  used only by the autotrader; the skills stay standard library.

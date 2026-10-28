@@ -1,0 +1,18 @@
+[Unit]
+Description=day-trader autotrader (opening-range breakout, Alpaca)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/home/trader/day-trader
+EnvironmentFile=/home/trader/day-trader.env
+ExecStart=/home/trader/day-trader/venv/bin/python /home/trader/day-trader/autotrader/autotrader.py daemon
+Restart=always
+RestartSec=60
+StandardOutput=append:/home/trader/day-trader/trader/state/autotrader.out
+StandardError=append:/home/trader/day-trader/trader/state/autotrader.out
+
+[Install]
+WantedBy=multi-user.target

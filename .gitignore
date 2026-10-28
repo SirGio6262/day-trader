@@ -11,3 +11,6 @@ __pycache__/
 
 # Local Claude Code settings (copy claude-settings.example.json here)
 .claude/settings.json
+
+# Local virtualenv for the autotrader
+venv/
