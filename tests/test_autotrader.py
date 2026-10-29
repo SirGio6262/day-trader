@@ -38,12 +38,17 @@ AAPL = [bar(9, 30, 250, 252, 249, 251), bar(9, 35, 251, 251.5, 250, 250.5), bar(
 
 
 class FakeBroker:
-    """Bars by symbol, orders that fill when told to."""
+    """Bars by symbol, orders that fill when told to. Like Alpaca, a bracket's legs hold its shares until they
+    are canceled, a cancel takes `cancel_lag` position reads to land, and the open-orders list (nested) does not
+    show the legs of a filled parent."""
 
-    def __init__(self, bars, cash=5000.0):
+    def __init__(self, bars, cash=5000.0, cancel_lag=0):
         self.all_bars = bars
         self.cash = cash
+        self.cancel_lag = cancel_lag
         self.orders = {}
+        self.legs = set()
+        self.pos = {}           # symbol -> [qty, avg price]
         self.n = 0
         self.canceled = []
         self.closed = []
@@ -67,6 +72,7 @@ class FakeBroker:
         o["client_order_id"] = client_id
         o["legs"] = [self._new(symbol, "sell", qty, "limit", "held"), self._new(symbol, "sell", qty, "stop", "held")]
         o["legs"][0]["limit_price"], o["legs"][1]["stop_price"] = target, stop
+        self.legs.update(l["id"] for l in o["legs"])
         self.submitted.append((symbol, qty, stop, target, client_id))
         return o
 
@@ -75,25 +81,53 @@ class FakeBroker:
         o["status"], o["filled_avg_price"], o["filled_qty"] = "filled", price, qty or o["qty"]
         for leg in o["legs"]:
             leg["status"] = "new"
+        q, sym = o["filled_qty"], o["symbol"]
+        if o["side"] == "buy":
+            held, avg = self.pos.get(sym, [0.0, 0.0])
+            self.pos[sym] = [held + q, (held * avg + q * price) / (held + q)]
+        elif sym in self.pos:
+            self.pos[sym][0] -= q
+            if self.pos[sym][0] <= 1e-9:
+                del self.pos[sym]
 
     def order(self, order_id):
         return self.orders[order_id]
 
     def open_orders(self, symbol=None):
-        return [o for o in self.orders.values() if o["status"] in ("new", "held") and (symbol is None or o["symbol"] == symbol)]
+        return [o for o in self.orders.values() if o["id"] not in self.legs and o["status"] in ("new", "held")
+                and (symbol is None or o["symbol"] == symbol)]
 
     def cancel(self, order_id):
-        self.orders[order_id]["status"] = "canceled"
+        self.orders[order_id]["status"] = "pending_cancel" if self.cancel_lag else "canceled"
+        self.orders[order_id]["lag"] = self.cancel_lag
         self.canceled.append(order_id)
 
+    def _held(self, symbol):
+        return any(self.orders[i]["symbol"] == symbol and self.orders[i]["status"] in ("new", "held", "pending_cancel")
+                   for i in self.legs)
+
+    def position(self, symbol):
+        for o in self.orders.values():
+            if o["status"] == "pending_cancel":
+                o["lag"] -= 1
+                if o["lag"] <= 0:
+                    o["status"] = "canceled"
+        if symbol not in self.pos:
+            return None
+        qty = self.pos[symbol][0]
+        return {"symbol": symbol, "qty": qty, "qty_available": 0.0 if self._held(symbol) else qty,
+                "avg_entry_price": self.pos[symbol][1]}
+
     def close_position(self, symbol):
-        o = self._new(symbol, "sell", 8, "market")
+        if self._held(symbol):
+            raise RuntimeError('{"code":40310000,"message":"insufficient qty available for order"}')
+        o = self._new(symbol, "sell", self.pos[symbol][0], "market")
         self.closed.append(symbol)
         self.fill(o["id"], 360.00)
         return o
 
     def positions(self):
-        return []
+        return [{"symbol": s, "qty": q, "avg_entry_price": p} for s, (q, p) in self.pos.items()]
 
 
 class Clock:
@@ -261,6 +295,26 @@ class SessionTest(unittest.TestCase):
         log = at.read_json(self.paths.broker_log)
         self.assertEqual(log["orders"][-1]["side"], "sell")
         self.assertEqual(log["orders"][-1]["price"], 360.0)
+
+    def test_flat_by_waits_until_the_broker_releases_the_shares(self):
+        # 2026-10-29: the legs were canceled but the shares stayed held for ~10 s, and the close was refused.
+        broker = FakeBroker({"TSLA": TSLA}, cancel_lag=8)
+        clock = Clock(t(9, 46))
+        s = self.run_day(broker, clock, {t(10, 16): lambda b, s: b.fill(s.trades["TSLA"]["order_id"], 364.20)})
+        self.assertEqual(broker.closed, ["TSLA"])
+        self.assertEqual(s.trades["TSLA"]["exit_by"], "flatten")
+        self.assertEqual(broker.positions(), [])
+
+    def test_a_position_left_from_an_earlier_day_is_closed_first(self):
+        broker = FakeBroker({"TSLA": TSLA, "AAPL": AAPL})
+        broker.pos["CRM"] = [8.0, 232.23]
+        clock = Clock(t(9, 46))
+        s = self.run_day(broker, clock, {})
+        self.assertEqual(broker.closed[0], "CRM")
+        self.assertTrue(s.trades["CRM"]["exit_filled"])
+        sells = [r for r in at.read_json(self.paths.broker_log)["orders"] if r.get("side") == "sell"]
+        self.assertEqual((sells[0]["symbol"], sells[0]["qty"], sells[0]["note"]), ("CRM", "8", "carried over"))
+        self.assertLess(sells[0]["at"], at.ny_iso(t(9, 50)))   # before the first entry can trigger
 
     def test_stop_file_flattens_and_stops(self):
         broker = FakeBroker({"TSLA": TSLA})

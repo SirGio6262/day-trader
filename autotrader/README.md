@@ -9,7 +9,9 @@ and `ALPACA_PAPER_TRADE` both say live.
 
 What it does, in order, every trading day (New York time):
 
-1. 09:45 start. The first 15 minutes (three 5-minute bars) are the range.
+1. 09:45 start. Any position it did not open today (a flatten that failed,
+   a buy by hand) is closed at market first. The first 15 minutes (three
+   5-minute bars) are the range.
 2. 09:50 to 10:30: every 5 minutes it fetches bars for the symbols and takes
    the first completed bar that closes above the range high. Strongest
    breakout first when several fire in the same bar.
@@ -19,7 +21,8 @@ What it does, in order, every trading day (New York time):
    list, reward to risk). PASS sends one bracket market order.
 4. Polls fills; logs the entry fill and whichever leg (stop or target)
    fills later.
-5. 15:55: cancels open legs and closes anything still open at market.
+5. 15:55: cancels open legs, waits (up to 30 s) until Alpaca frees the
+   shares they hold, and closes anything still open at market.
 6. Prints the journal report and sends it to Telegram if configured.
 
 `trader/STOP` (any content) stops new entries and flattens at once. Delete
