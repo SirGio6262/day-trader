@@ -68,6 +68,11 @@ DEFAULTS = {
 }
 
 
+DONE = ("filled", "canceled", "expired", "rejected")   # order states that hold no shares
+NOT_OURS = ("manual", "carried")                        # positions without a bracket of this process
+RELEASE_WAIT_SECONDS = 30
+
+
 class AutoError(Exception):
     pass
 
@@ -405,6 +410,19 @@ class Alpaca:
     def close_position(self, symbol):
         return self._order(self.trading.close_position(symbol))
 
+    def position(self, symbol):
+        """The open position, with the shares not held by open orders, or None when there is none."""
+        from alpaca.common.exceptions import APIError
+        try:
+            p = self.trading.get_open_position(symbol)
+        except APIError as e:
+            if getattr(e, "status_code", None) == 404:
+                return None
+            raise
+        qty = float(p.qty)
+        return {"symbol": p.symbol, "qty": qty, "avg_entry_price": float(p.avg_entry_price),
+                "qty_available": float(p.qty_available) if p.qty_available is not None else qty}
+
     def positions(self):
         return [{"symbol": p.symbol, "qty": float(p.qty), "avg_entry_price": float(p.avg_entry_price)}
                 for p in self.trading.get_all_positions()]
@@ -502,7 +520,7 @@ class Session:
 
     def poll_fills(self, now):
         for sym, t in self.trades.items():
-            if "order_id" not in t or t.get("exit_filled"):
+            if "order_id" not in t or t.get("exit_filled") or t["order_id"] in NOT_OURS:
                 continue
             try:
                 o = self.b.order(t["order_id"])
@@ -533,9 +551,10 @@ class Session:
 
     # ---- flatten
 
-    def flatten(self, now, why="flat by"):
+    def flatten(self, now, why="flat by", symbols=None):
+        self.poll_fills(now)   # a stop or target may have filled since the last poll
         for sym, t in self.trades.items():
-            if "order_id" not in t or t.get("exit_filled"):
+            if "order_id" not in t or t.get("exit_filled") or (symbols is not None and sym not in symbols):
                 continue
             try:
                 if not t.get("entry_filled"):
@@ -543,9 +562,12 @@ class Session:
                     t["exit_filled"], t["note"] = True, "entry canceled at %s" % why
                     self.say("%s: unfilled entry canceled (%s)" % (sym, why))
                     continue
-                for o in self.b.open_orders(sym):
-                    self.b.cancel(o["id"])
-                self.sleep_fn(2)
+                if not self.release(sym, t):
+                    self.poll_fills(now)
+                    if not t.get("exit_filled"):
+                        t["exit_filled"], t["note"] = True, "no position left at the broker at %s" % why
+                        self.say("%s: no position left at the broker; check the fills by hand" % sym)
+                    continue
                 o = self.b.close_position(sym)
                 price = None
                 for _ in range(30):
@@ -565,12 +587,53 @@ class Session:
             finally:
                 self.save()
 
+    def release(self, sym, t):
+        """Cancel the bracket's stop and target, then wait until the broker frees the shares they hold.
+        Alpaca's open-orders list hides the legs of a filled parent, so the legs come from the parent itself,
+        and a cancel lands seconds later, not at once. False when the position is already gone."""
+        ids = {o["id"] for o in self.b.open_orders(sym)}
+        if t["order_id"] not in NOT_OURS:
+            ids |= {leg["id"] for leg in self.b.order(t["order_id"]).get("legs", []) if leg["status"] not in DONE}
+        for oid in ids:
+            try:
+                self.b.cancel(oid)
+            except Exception as e:
+                self.say("%s: cancel of %s failed: %s" % (sym, oid, e), quiet=True)
+        for _ in range(RELEASE_WAIT_SECONDS):
+            pos = self.b.position(sym)
+            if pos is None:
+                return False
+            if pos["qty_available"] >= pos["qty"] - 1e-9:
+                return True
+            self.sleep_fn(1)
+        raise AutoError("%s of %s shares still held for orders after %d s"
+                        % (pos["qty"] - pos["qty_available"], pos["qty"], RELEASE_WAIT_SECONDS))
+
+    def close_leftovers(self, now):
+        """A position this session did not open (a failed flatten, a buy by hand) breaks flat-by: close it first."""
+        try:
+            left = [p for p in self.b.positions() if p["symbol"] not in self.trades]
+        except Exception as e:
+            self.say("could not read positions: %s" % e)
+            return
+        if not left:
+            return
+        for p in left:
+            self.trades[p["symbol"]] = {"order_id": "carried", "qty": p["qty"], "filled_qty": p["qty"],
+                                        "entry_filled": True, "entry_price": p["avg_entry_price"], "max_loss": 0.0,
+                                        "exit_filled": False}
+        self.save()
+        self.say("%s not opened today; closing at market first" % ", ".join(
+            "%s x%g" % (p["symbol"], p["qty"]) for p in left))
+        self.flatten(now, why="carried over", symbols=[p["symbol"] for p in left])
+
     # ---- the day
 
     def run(self):
         self.say("autotrader %s: %s, %d symbols, entries %s-%s, flat by %s"
                  % (self.date, "PAPER" if self.paper else "LIVE", len(self.auto["symbols"]), self.auto["entry_from"],
                     self.auto["entry_until"], hm(self.flat_by)))
+        self.close_leftovers(self.now_fn())
         last_scan_slot = None
         while True:
             now = self.now_fn()
