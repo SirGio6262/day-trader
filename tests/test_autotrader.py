@@ -39,13 +39,17 @@ AAPL = [bar(9, 30, 250, 252, 249, 251), bar(9, 35, 251, 251.5, 250, 250.5), bar(
 
 class FakeBroker:
     """Bars by symbol, orders that fill when told to. Like Alpaca, a bracket's legs hold its shares until they
-    are canceled, a cancel takes `cancel_lag` position reads to land, and the open-orders list (nested) does not
-    show the legs of a filled parent."""
+    are canceled, a cancel takes `cancel_lag` position reads to land, the flat open-orders list shows the legs
+    as orders of their own, and a close is refused with "insufficient qty" while any leg still holds shares.
+    `broken_qty_available` reports 0 available shares forever; `refuse_close` names symbols whose single close
+    always fails, so only close-all can liquidate them."""
 
-    def __init__(self, bars, cash=5000.0, cancel_lag=0):
+    def __init__(self, bars, cash=5000.0, cancel_lag=0, broken_qty_available=False, refuse_close=()):
         self.all_bars = bars
         self.cash = cash
         self.cancel_lag = cancel_lag
+        self.broken_qty_available = broken_qty_available
+        self.refuse_close = set(refuse_close)
         self.orders = {}
         self.legs = set()
         self.pos = {}           # symbol -> [qty, avg price]
@@ -53,6 +57,7 @@ class FakeBroker:
         self.canceled = []
         self.closed = []
         self.submitted = []
+        self.close_all_calls = 0
 
     def account(self):
         return {"cash": self.cash, "equity": self.cash, "buying_power": self.cash, "status": "ACTIVE"}
@@ -76,11 +81,12 @@ class FakeBroker:
         self.submitted.append((symbol, qty, stop, target, client_id))
         return o
 
-    def fill(self, order_id, price, qty=None):
+    def fill(self, order_id, price, qty=None, partial=False):
         o = self.orders[order_id]
-        o["status"], o["filled_avg_price"], o["filled_qty"] = "filled", price, qty or o["qty"]
-        for leg in o["legs"]:
-            leg["status"] = "new"
+        o["status"], o["filled_avg_price"], o["filled_qty"] = ("partially_filled" if partial else "filled"), price, qty or o["qty"]
+        if not partial:
+            for leg in o["legs"]:
+                leg["status"] = "new"
         q, sym = o["filled_qty"], o["symbol"]
         if o["side"] == "buy":
             held, avg = self.pos.get(sym, [0.0, 0.0])
@@ -94,7 +100,7 @@ class FakeBroker:
         return self.orders[order_id]
 
     def open_orders(self, symbol=None):
-        return [o for o in self.orders.values() if o["id"] not in self.legs and o["status"] in ("new", "held")
+        return [o for o in self.orders.values() if o["status"] in ("new", "held", "partially_filled")
                 and (symbol is None or o["symbol"] == symbol)]
 
     def cancel(self, order_id):
@@ -115,16 +121,29 @@ class FakeBroker:
         if symbol not in self.pos:
             return None
         qty = self.pos[symbol][0]
-        return {"symbol": symbol, "qty": qty, "qty_available": 0.0 if self._held(symbol) else qty,
-                "avg_entry_price": self.pos[symbol][1]}
+        avail = 0.0 if (self._held(symbol) or self.broken_qty_available) else qty
+        return {"symbol": symbol, "qty": qty, "qty_available": avail, "avg_entry_price": self.pos[symbol][1]}
 
     def close_position(self, symbol):
-        if self._held(symbol):
+        if self._held(symbol) or symbol in self.refuse_close:
             raise RuntimeError('{"code":40310000,"message":"insufficient qty available for order"}')
         o = self._new(symbol, "sell", self.pos[symbol][0], "market")
         self.closed.append(symbol)
         self.fill(o["id"], 360.00)
         return o
+
+    def close_all_positions(self):
+        self.close_all_calls += 1
+        for o in self.orders.values():
+            if o["status"] in ("new", "held", "pending_cancel", "partially_filled"):
+                o["status"] = "canceled"
+        out = {}
+        for symbol in list(self.pos):
+            o = self._new(symbol, "sell", self.pos[symbol][0], "market")
+            self.closed.append(symbol)
+            self.fill(o["id"], 359.00)
+            out[symbol] = o
+        return out
 
     def positions(self):
         return [{"symbol": s, "qty": q, "avg_entry_price": p} for s, (q, p) in self.pos.items()]
@@ -157,6 +176,14 @@ class RuleTest(unittest.TestCase):
         self.assertIsNone(at.breakout_bar(TSLA, orr, t(10, 15), t(9, 30), 15, t(9, 50), t(10, 0)))
         # AAPL never breaks out.
         self.assertIsNone(at.breakout_bar(AAPL, at.opening_range(AAPL, 15, t(9, 30)), t(10, 15), t(9, 30), 15, t(9, 50), t(10, 30)))
+
+    def test_a_bar_seen_a_slot_late_is_not_chased(self):
+        orr = at.opening_range(TSLA, 15, t(9, 30))
+        # At 10:20 the 10:10 breakout bar is a slot old; the 10:15 bar also closed above the high, so it is the entry.
+        b = at.breakout_bar(TSLA, orr, t(10, 20), t(9, 30), 15, t(9, 50), t(10, 30))
+        self.assertEqual(b["t"], t(10, 15))
+        # At 10:25 both are stale: nothing.
+        self.assertIsNone(at.breakout_bar(TSLA, orr, t(10, 25), t(9, 30), 15, t(9, 50), t(10, 30)))
 
     def test_plan_matches_the_pack_example(self):
         orr = at.opening_range(TSLA, 15, t(9, 30))
@@ -316,6 +343,84 @@ class SessionTest(unittest.TestCase):
         self.assertEqual((sells[0]["symbol"], sells[0]["qty"], sells[0]["note"]), ("CRM", "8", "carried over"))
         self.assertLess(sells[0]["at"], at.ny_iso(t(9, 50)))   # before the first entry can trigger
 
+    def three(self, **kw):
+        """Three symbols that all break out on the same bar."""
+        broker = FakeBroker({"TSLA": TSLA, "NVDA": list(TSLA), "AMD": list(TSLA)}, **kw)
+        self.auto["symbols"] = ["TSLA", "NVDA", "AMD"]
+        return broker
+
+    def fill_all(self, b, s):
+        for sym in ("TSLA", "NVDA", "AMD"):
+            b.fill(s.trades[sym]["order_id"], 364.20)
+
+    def test_flat_by_closes_several_positions_within_one_wait(self):
+        # 2026-10-29: three of five positions were not closed; one by one, each could take 90 s and the last
+        # ones ran past the close. Now the legs of all symbols are canceled first and one wait covers them all.
+        broker = self.three(cancel_lag=8)
+        clock = Clock(t(9, 46))
+        s = self.run_day(broker, clock, {t(10, 16): self.fill_all})
+        self.assertEqual(sorted(broker.closed), ["AMD", "NVDA", "TSLA"])
+        self.assertEqual(broker.positions(), [])
+        self.assertTrue(all(s.trades[x]["exit_by"] == "flatten" for x in ("TSLA", "NVDA", "AMD")))
+        self.assertLess(clock.now, t(15, 57))
+        self.assertEqual(broker.close_all_calls, 0)
+
+    def test_flat_by_closes_anyway_when_qty_available_never_clears(self):
+        broker = FakeBroker({"TSLA": TSLA}, cancel_lag=3, broken_qty_available=True)
+        clock = Clock(t(9, 46))
+        s = self.run_day(broker, clock, {t(10, 16): lambda b, s: b.fill(s.trades["TSLA"]["order_id"], 364.20)})
+        self.assertEqual(broker.closed, ["TSLA"])
+        self.assertEqual(s.trades["TSLA"]["exit_by"], "flatten")
+        self.assertLess(clock.now, t(15, 58))
+
+    def test_close_all_is_the_last_resort_of_a_full_flatten(self):
+        broker = self.three(refuse_close=["NVDA"])
+        clock = Clock(t(9, 46))
+        s = self.run_day(broker, clock, {t(10, 16): self.fill_all})
+        self.assertEqual(broker.close_all_calls, 1)
+        self.assertEqual(broker.positions(), [])
+        self.assertTrue(s.trades["NVDA"]["exit_filled"])
+        self.assertEqual(s.trades["NVDA"]["exit_price"], 359.0)
+        sells = [r for r in at.read_json(self.paths.broker_log)["orders"] if r.get("side") == "sell"]
+        self.assertEqual(sorted(r["symbol"] for r in sells), ["AMD", "NVDA", "TSLA"])
+        self.assertIn("close-all", [r for r in sells if r["symbol"] == "NVDA"][0]["note"])
+
+    def test_a_partially_filled_entry_is_closed_at_flat_by(self):
+        broker = FakeBroker({"TSLA": TSLA})
+        clock = Clock(t(9, 46))
+        s = self.run_day(broker, clock, {t(10, 16): lambda b, s: b.fill(s.trades["TSLA"]["order_id"], 364.20, qty=3, partial=True)})
+        self.assertEqual(broker.closed, ["TSLA"])
+        self.assertEqual(broker.positions(), [])
+        self.assertEqual(s.trades["TSLA"]["exit_by"], "flatten")
+        fills = [(r["side"], r["qty"]) for r in at.read_json(self.paths.broker_log)["orders"] if r["status"] == "filled"]
+        self.assertEqual(fills, [("buy", "3"), ("sell", "3")])
+        trades, still_open = journal.trades_from_broker_log(at.read_json(self.paths.broker_log), 0.0)
+        self.assertEqual((len(trades), still_open), (1, {}))
+
+    def test_a_leftover_whose_leg_is_still_live_is_released_first(self):
+        broker = FakeBroker({"TSLA": TSLA, "AAPL": AAPL})
+        broker.pos["CRM"] = [8.0, 232.23]
+        orphan = broker._new("CRM", "sell", 8, "stop", "new")   # a stop from a bracket this process never knew
+        broker.legs.add(orphan["id"])
+        clock = Clock(t(9, 46))
+        s = self.run_day(broker, clock, {})
+        self.assertIn(orphan["id"], broker.canceled)
+        self.assertEqual(broker.closed[0], "CRM")
+        self.assertTrue(s.trades["CRM"]["exit_filled"])
+
+    def test_open_risk_counts_entries_that_have_not_filled_yet(self):
+        self.cfg["max_daily_loss_usd"] = 60
+        at.write_json(self.paths.config, self.cfg)
+        broker = self.three()
+        clock = Clock(t(9, 46))
+        s = at.Session(broker, self.cfg, self.auto, self.paths, True, now_fn=clock, sleep_fn=clock.sleep)
+        with redirect_stdout(io.StringIO()):
+            s.scan_once(t(10, 15))
+        self.assertEqual(len(broker.submitted), 1)
+        blocked = [v for v in s.trades.values() if "blocked" in v]
+        self.assertEqual(len(blocked), 2)
+        self.assertTrue(all(any("daily limit" in r for r in v["blocked"]) for v in blocked))
+
     def test_stop_file_flattens_and_stops(self):
         broker = FakeBroker({"TSLA": TSLA})
         clock = Clock(t(9, 46))
@@ -355,6 +460,14 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(len(broker.submitted), 1)
         blocked = [k for k, v in s.trades.items() if "blocked" in v]
         self.assertEqual(len(blocked), 1)
+
+    def test_daemon_runs_the_session_once_a_day(self):
+        nxt = dt.datetime(2026, 10, 20, 9, 30, tzinfo=NY)
+        self.assertEqual(at.daemon_plan(t(9, 0), False, t(9, 30), self.auto, None), ("sleep", t(9, 31)))
+        self.assertEqual(at.daemon_plan(t(9, 31), True, nxt, self.auto, None), ("run", t(16, 5)))
+        self.assertEqual(at.daemon_plan(t(11, 30), True, nxt, self.auto, DAY), ("sleep", t(16, 5)))
+        self.assertEqual(at.daemon_plan(t(16, 30), False, nxt, self.auto, DAY), ("sleep", nxt.replace(hour=9, minute=31)))
+        self.assertEqual(at.daemon_plan(t(11, 30), True, nxt, self.auto, None), ("run", t(16, 5)))   # a restart mid-day
 
     def test_paper_mismatch_is_refused(self):
         os.environ["ALPACA_PAPER_TRADE"] = "false"

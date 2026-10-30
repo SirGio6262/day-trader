@@ -9,20 +9,28 @@ and `ALPACA_PAPER_TRADE` both say live.
 
 What it does, in order, every trading day (New York time):
 
-1. 09:45 start. Any position it did not open today (a flatten that failed,
-   a buy by hand) is closed at market first. The first 15 minutes (three
-   5-minute bars) are the range.
-2. 09:50 to 10:30: every 5 minutes it fetches bars for the symbols and takes
-   the first completed bar that closes above the range high. Strongest
-   breakout first when several fire in the same bar.
+1. 09:31 start. Any position it did not open today (a flatten that failed,
+   a buy by hand) is closed at market first, at the open. The first 15
+   minutes (three 5-minute bars) are the range.
+2. 09:50 to 10:30: every poll (15 s) it fetches bars for the symbols and
+   takes the first completed bar that closes above the range high. A bar
+   that completed more than 5 minutes ago is never chased: only a later
+   bar that also closes above the high counts. Strongest breakout first
+   when several fire in the same bar.
 3. Stop at the range midpoint, target at `target_r` times the risk, whole
    shares sized by the smallest of the config's limits, then the risk
    check (per-trade loss, daily loss, trades per day, window, blocked
    list, reward to risk). PASS sends one bracket market order.
 4. Polls fills; logs the entry fill and whichever leg (stop or target)
    fills later.
-5. 15:55: cancels open legs, waits (up to 30 s) until Alpaca frees the
-   shares they hold, and closes anything still open at market.
+5. 15:55: cancels the legs of every open trade, waits (up to 30 s, for
+   all symbols at once) until Alpaca frees the shares they hold, sends one
+   market close per symbol (re-sent for up to 30 s more while Alpaca still
+   answers "insufficient qty"), and waits up to 60 s for the fills. The
+   whole flatten takes about two minutes at worst, however many positions
+   are open. If a symbol still cannot be closed, Alpaca's close-all
+   (cancel every order, liquidate everything) is the last resort; a
+   partially filled entry is closed for what filled.
 6. Prints the journal report and sends it to Telegram if configured.
 
 `trader/STOP` (any content) stops new entries and flattens at once. Delete
@@ -134,6 +142,8 @@ the service, and 60 more trades before `report --live` says anything.
   is not always a breakout on SIP. Paper trading will show how often.
 - Market entries fill at the next print, not the bar close the rule saw.
   The journal measures the real fill, so slippage shows in R.
-- Partial fills: the process waits for `filled`; a partially filled entry
-  at 15:55 is flattened for what filled.
+- Partial fills: the process waits for `filled` before it reports an
+  entry; at 15:55 a partially filled entry is canceled and the filled
+  shares are closed, and a stop or target that filled in part is logged
+  as its own sell so the journal stays whole.
 - One process, one account. Do not run two copies against the same keys.
