@@ -70,7 +70,10 @@ DEFAULTS = {
 
 DONE = ("filled", "canceled", "expired", "rejected")   # order states that hold no shares
 NOT_OURS = ("manual", "carried")                        # positions without a bracket of this process
-RELEASE_WAIT_SECONDS = 30
+RELEASE_WAIT_SECONDS = 30      # how long to wait for Alpaca to free the shares a canceled leg held
+CLOSE_RETRY_SECONDS = 30       # how long to keep re-sending a close that Alpaca refuses as "insufficient qty"
+CONFIRM_WAIT_SECONDS = 60      # how long to wait for the close orders to report a fill
+HELD_ERROR = ("insufficient qty", "40310000")
 
 
 class AutoError(Exception):
@@ -176,7 +179,10 @@ def opening_range(bars, or_minutes, session_open):
 
 
 def breakout_bar(bars, orr, now, session_open, or_minutes, entry_from, entry_until, min_volume=0):
-    """The first completed 5-minute bar after the range that CLOSES above its high, inside the window."""
+    """The first completed 5-minute bar after the range that CLOSES above its high, inside the window.
+    A bar that completed more than one slot (5 minutes) ago is not an entry any more: the pack's rule is the
+    bar close or nothing, never a chase, so a bar seen late (data delay, a restart) is skipped and only a
+    later bar that also closes above the high counts."""
     range_end = session_open + dt.timedelta(minutes=or_minutes)
     for b in sorted(bars, key=lambda x: x["t"]):
         if b["t"] < range_end:
@@ -187,6 +193,8 @@ def breakout_bar(bars, orr, now, session_open, or_minutes, entry_from, entry_unt
         if done < entry_from or done > entry_until:
             if done > entry_until:
                 break
+            continue
+        if now - done >= dt.timedelta(minutes=5):
             continue
         if b["c"] > orr["high"] and b["v"] >= min_volume:
             return b
@@ -331,7 +339,7 @@ def notify(paths, text, quiet=False):
     if tok and chat and not quiet:
         try:
             data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
-            urllib.request.urlopen("https://api.telegram.org/bot%s/sendMessage" % tok, data=data, timeout=10).read()
+            urllib.request.urlopen("https://api.telegram.org/bot%s/sendMessage" % tok, data=data, timeout=5).read()
         except Exception as e:  # a failed notification never stops the trading loop
             with open(paths.log, "a", encoding="utf-8") as fh:
                 fh.write("%s  telegram failed: %s\n" % (ny_iso(now_ny()), e))
@@ -399,9 +407,11 @@ class Alpaca:
         return self._order(self.trading.get_order_by_id(order_id, GetOrderByIdRequest(nested=True)))
 
     def open_orders(self, symbol=None):
+        """Every open order, the legs of a bracket as orders of their own (nested=False). With nested=True Alpaca
+        rolls the legs under their parent, and a filled parent is not open, so its live legs vanish from the list."""
         from alpaca.trading.requests import GetOrdersRequest
         from alpaca.trading.enums import QueryOrderStatus
-        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True, symbols=([symbol] if symbol else None))
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=False, symbols=([symbol] if symbol else None))
         return [self._order(o) for o in self.trading.get_orders(req)]
 
     def cancel(self, order_id):
@@ -409,6 +419,17 @@ class Alpaca:
 
     def close_position(self, symbol):
         return self._order(self.trading.close_position(symbol))
+
+    def close_all_positions(self):
+        """Alpaca cancels every open order and liquidates every position server side; {symbol: close order}."""
+        out = {}
+        for r in self.trading.close_all_positions(cancel_orders=True):
+            body = getattr(r, "body", None)
+            if body is not None and getattr(body, "id", None) is not None:
+                out[r.symbol] = self._order(body)
+            else:
+                out[r.symbol] = {"id": None, "status": str(getattr(r, "status", "")), "body": str(body)}
+        return out
 
     def position(self, symbol):
         """The open position, with the shares not held by open orders, or None when there is none."""
@@ -457,8 +478,10 @@ class Session:
         return os.path.exists(self.paths.stop)
 
     def open_risk(self):
+        """Max loss of every trade that is placed or open: an entry sent seconds ago counts before it fills,
+        or several breakouts in one slot would each see an empty book and pass the daily limit together."""
         return round(sum(t["max_loss"] for t in self.trades.values()
-                         if t.get("entry_filled") and not t.get("exit_filled")), 2)
+                         if "order_id" in t and not t.get("exit_filled")), 2)
 
     # ---- entries
 
@@ -552,62 +575,173 @@ class Session:
     # ---- flatten
 
     def flatten(self, now, why="flat by", symbols=None):
+        """Close every open trade (or the given symbols) at market, all of them in parallel, so the whole
+        flatten takes about one release wait plus one confirmation wait, not that much per symbol:
+        1. cancel the bracket legs of every symbol (an unfilled entry is canceled instead);
+        2. wait, for all symbols at once, until Alpaca frees the shares the legs held;
+        3. send a market close per symbol, re-sent while Alpaca still answers "insufficient qty";
+        4. wait for the close orders to fill and log each fill.
+        When the whole book is being flattened and a symbol still failed, Alpaca's close-all is the last resort."""
         self.poll_fills(now)   # a stop or target may have filled since the last poll
+        todo = {}
         for sym, t in self.trades.items():
             if "order_id" not in t or t.get("exit_filled") or (symbols is not None and sym not in symbols):
                 continue
             try:
-                if not t.get("entry_filled"):
-                    self.b.cancel(t["order_id"])
-                    t["exit_filled"], t["note"] = True, "entry canceled at %s" % why
-                    self.say("%s: unfilled entry canceled (%s)" % (sym, why))
+                if not t.get("entry_filled") and not self.cancel_entry(sym, t, why):
                     continue
-                if not self.release(sym, t):
-                    self.poll_fills(now)
-                    if not t.get("exit_filled"):
-                        t["exit_filled"], t["note"] = True, "no position left at the broker at %s" % why
-                        self.say("%s: no position left at the broker; check the fills by hand" % sym)
-                    continue
-                o = self.b.close_position(sym)
-                price = None
-                for _ in range(30):
-                    o = self.b.order(o["id"])
-                    if o["status"] == "filled" and o["filled_avg_price"]:
-                        price = o["filled_avg_price"]
-                        break
-                    self.sleep_fn(2)
-                if price is None:
-                    self.say("%s: close order %s not confirmed filled yet; check the broker" % (sym, o["id"]))
-                    continue
-                t["exit_filled"], t["exit_price"], t["exit_by"] = True, price, "flatten"
-                log_fill(self.paths, now, self.date, sym, "sell", int(o["filled_qty"]), price, note="%s" % why)
-                self.say("%s: flattened at %.2f (%s), P&L $%.2f" % (sym, price, why, (price - t["entry_price"]) * o["filled_qty"]))
+                self.cancel_legs(sym, t)
+                todo[sym] = t
             except Exception as e:
                 self.say("%s: flatten FAILED: %s. Close it by hand." % (sym, e))
             finally:
                 self.save()
+        closing, failed = self.send_closes(todo, why)
+        self.confirm_closes(closing, now, why)
+        failed = [sym for sym in failed if not self.trades[sym].get("exit_filled")]
+        if failed and symbols is None:
+            self.last_resort(failed, now, why)
+        self.save()
 
-    def release(self, sym, t):
-        """Cancel the bracket's stop and target, then wait until the broker frees the shares they hold.
-        Alpaca's open-orders list hides the legs of a filled parent, so the legs come from the parent itself,
-        and a cancel lands seconds later, not at once. False when the position is already gone."""
-        ids = {o["id"] for o in self.b.open_orders(sym)}
+    def cancel_entry(self, sym, t, why):
+        """Cancel an entry that has not filled. True when part of it did fill and those shares must be closed."""
+        self.b.cancel(t["order_id"])
+        o = None
+        for _ in range(5):
+            o = self.b.order(t["order_id"])
+            if o["status"] in DONE or o["filled_qty"] > 0:
+                break
+            self.sleep_fn(1)
+        if o and o["filled_qty"] > 0 and o["filled_avg_price"]:
+            t["entry_filled"], t["entry_price"], t["filled_qty"] = True, o["filled_avg_price"], o["filled_qty"]
+            log_fill(self.paths, self.now_fn(), self.date, sym, "buy", int(o["filled_qty"]), o["filled_avg_price"],
+                     note="partial fill, entry canceled at %s" % why)
+            self.say("%s: entry canceled at %s with %d of %d shares filled at %.2f; closing them"
+                     % (sym, why, int(o["filled_qty"]), int(t["qty"]), o["filled_avg_price"]))
+            return True
+        t["exit_filled"], t["note"] = True, "entry canceled at %s" % why
+        self.say("%s: unfilled entry canceled (%s)" % (sym, why))
+        return False
+
+    def cancel_legs(self, sym, t):
+        """Cancel the bracket's stop and target: from the parent order when it is ours, and from the flat
+        open-orders list in any case (a bracket placed by hand, a parent this process never knew)."""
+        ids = set()
+        try:
+            ids |= {o["id"] for o in self.b.open_orders(sym)}
+        except Exception as e:
+            self.say("%s: could not list open orders: %s" % (sym, e), quiet=True)
         if t["order_id"] not in NOT_OURS:
-            ids |= {leg["id"] for leg in self.b.order(t["order_id"]).get("legs", []) if leg["status"] not in DONE}
+            try:
+                ids |= {leg["id"] for leg in self.b.order(t["order_id"]).get("legs", []) if leg["status"] not in DONE}
+            except Exception as e:
+                self.say("%s: could not read order %s: %s" % (sym, t["order_id"], e), quiet=True)
         for oid in ids:
             try:
                 self.b.cancel(oid)
             except Exception as e:
                 self.say("%s: cancel of %s failed: %s" % (sym, oid, e), quiet=True)
-        for _ in range(RELEASE_WAIT_SECONDS):
-            pos = self.b.position(sym)
-            if pos is None:
-                return False
-            if pos["qty_available"] >= pos["qty"] - 1e-9:
-                return True
+
+    def send_closes(self, todo, why):
+        """Wait until the broker frees the shares of every symbol in `todo`, closing each one as soon as it is
+        free; after RELEASE_WAIT_SECONDS close the rest anyway and keep re-sending while Alpaca says the
+        shares are held. Returns ({symbol: close order}, [symbols that could not be closed])."""
+        pending = dict(todo)
+        closing, failed = {}, []
+        deadline = RELEASE_WAIT_SECONDS + CLOSE_RETRY_SECONDS
+        for i in range(deadline + 1):
+            for sym in list(pending):
+                t = pending[sym]
+                try:
+                    pos = self.b.position(sym)
+                except Exception as e:
+                    self.say("%s: could not read the position: %s" % (sym, e), quiet=True)
+                    pos = {"qty": t.get("filled_qty", t["qty"]), "qty_available": 0.0}
+                if pos is None:
+                    del pending[sym]
+                    self.poll_fills(self.now_fn())
+                    if not t.get("exit_filled"):
+                        self.log_leg_partials(sym, t)
+                        t["exit_filled"], t["note"] = True, "no position left at the broker at %s" % why
+                        self.say("%s: no position left at the broker; check the fills by hand" % sym)
+                    continue
+                if pos["qty_available"] < pos["qty"] - 1e-9 and i < RELEASE_WAIT_SECONDS:
+                    continue
+                try:
+                    closing[sym] = (t, self.b.close_position(sym))
+                    del pending[sym]
+                except Exception as e:
+                    if any(k in str(e) for k in HELD_ERROR) and i < deadline:
+                        continue
+                    del pending[sym]
+                    failed.append(sym)
+                    self.say("%s: flatten FAILED: %s" % (sym, e))
+            if not pending:
+                break
             self.sleep_fn(1)
-        raise AutoError("%s of %s shares still held for orders after %d s"
-                        % (pos["qty"] - pos["qty_available"], pos["qty"], RELEASE_WAIT_SECONDS))
+        for sym in pending:
+            failed.append(sym)
+            self.say("%s: flatten FAILED: shares still held for orders after %d s" % (sym, deadline))
+        return closing, failed
+
+    def confirm_closes(self, closing, now, why):
+        """Poll every close order until it fills (or CONFIRM_WAIT_SECONDS pass), logging each fill."""
+        left = dict(closing)
+        for i in range(CONFIRM_WAIT_SECONDS // 2 + 1):
+            for sym in list(left):
+                t, o = left[sym]
+                try:
+                    o = self.b.order(o["id"])
+                except Exception as e:
+                    self.say("%s: could not read close order %s: %s" % (sym, o["id"], e), quiet=True)
+                    continue
+                if o["status"] == "filled" and o["filled_avg_price"]:
+                    del left[sym]
+                    self.log_leg_partials(sym, t)
+                    price = o["filled_avg_price"]
+                    t["exit_filled"], t["exit_price"], t["exit_by"] = True, price, "flatten"
+                    log_fill(self.paths, now, self.date, sym, "sell", int(o["filled_qty"]), price, note="%s" % why)
+                    self.say("%s: flattened at %.2f (%s), P&L $%.2f"
+                             % (sym, price, why, (price - t["entry_price"]) * o["filled_qty"]))
+                    self.save()
+            if not left:
+                break
+            self.sleep_fn(2)
+        for sym, (t, o) in left.items():
+            t["close_order_id"] = o["id"]
+            self.say("%s: close order %s not confirmed filled after %d s; check the broker" % (sym, o["id"], CONFIRM_WAIT_SECONDS))
+
+    def log_leg_partials(self, sym, t):
+        """A stop or target that filled only in part before the flatten still sold shares: the journal needs it."""
+        if t["order_id"] in NOT_OURS or t.get("leg_partial_logged"):
+            return
+        try:
+            legs = self.b.order(t["order_id"]).get("legs", [])
+        except Exception:
+            return
+        for leg in legs:
+            if leg["status"] != "filled" and leg["filled_qty"] > 0 and leg["filled_avg_price"]:
+                which = "stop" if leg.get("type") in ("stop", "stop_limit") else "target"
+                log_fill(self.paths, self.now_fn(), self.date, sym, "sell", int(leg["filled_qty"]), leg["filled_avg_price"],
+                         note="%s partial fill" % which)
+                self.say("%s: %s had filled %d shares at %.2f before the flatten" % (sym, which, int(leg["filled_qty"]),
+                                                                                    leg["filled_avg_price"]))
+                t["leg_partial_logged"] = True
+
+    def last_resort(self, failed, now, why):
+        """Alpaca's close-all: it cancels every order and liquidates everything server side. Only when the whole
+        book is being flattened anyway, so nothing is closed that should stay open."""
+        self.say("%s could not be closed one by one; asking Alpaca to close everything" % ", ".join(failed))
+        try:
+            orders = self.b.close_all_positions()
+        except Exception as e:
+            self.say("close-all FAILED: %s. Close %s by hand." % (e, ", ".join(failed)))
+            return
+        closing = {sym: (self.trades[sym], orders[sym]) for sym in failed if orders.get(sym, {}).get("id")}
+        for sym in failed:
+            if sym not in closing:
+                self.say("%s: close-all gave no order (%s). Close it by hand." % (sym, orders.get(sym)))
+        self.confirm_closes(closing, now, why + ", close-all")
 
     def close_leftovers(self, now):
         """A position this session did not open (a failed flatten, a buy by hand) breaks flat-by: close it first."""
@@ -634,7 +768,6 @@ class Session:
                  % (self.date, "PAPER" if self.paper else "LIVE", len(self.auto["symbols"]), self.auto["entry_from"],
                     self.auto["entry_until"], hm(self.flat_by)))
         self.close_leftovers(self.now_fn())
-        last_scan_slot = None
         while True:
             now = self.now_fn()
             if self.stop_requested():
@@ -645,13 +778,12 @@ class Session:
                 self.flatten(now)
                 break
             if self.entry_from <= now <= self.entry_until + dt.timedelta(minutes=1):
-                slot = (now.hour, now.minute - now.minute % 5)
-                if slot != last_scan_slot and now.second >= 5:
-                    last_scan_slot = slot
-                    try:
-                        self.scan_once(now)
-                    except Exception as e:
-                        self.say("scan failed: %s" % e, quiet=True)
+                # Every poll, not once per 5-minute slot: a bar Alpaca publishes a few seconds late is then
+                # still seen inside its own slot. A symbol already in self.trades is never scanned again.
+                try:
+                    self.scan_once(now)
+                except Exception as e:
+                    self.say("scan failed: %s" % e, quiet=True)
             live = [t for t in self.trades.values() if "order_id" in t and not t.get("exit_filled")]
             if live:
                 self.poll_fills(now)
@@ -720,7 +852,29 @@ def cmd_day(a, paths):
     return 0
 
 
+def session_start(day, auto):
+    """When the daemon starts the day's session: at 09:31, so a position carried from an earlier day is
+    closed at the open, or five minutes before the entry window if that is earlier."""
+    return min(at_time(day, "09:31"), at_time(day, auto["entry_from"]) - dt.timedelta(minutes=5))
+
+
+def daemon_plan(now, is_open, next_open, auto, ran):
+    """What the daemon does now: ("run", target) to run today's session then sleep until target, or
+    ("sleep", target). `ran` is the date whose session already ran, so an early finish (every trade closed
+    before the close) does not start the session, and its summary, again every half hour."""
+    session_today = is_open or next_open.date() == now.date()
+    start = session_start(now.date(), auto)
+    if session_today and now < at_time(now.date(), "16:00"):
+        if now < start:
+            return "sleep", start
+        if ran != now.date():
+            return "run", at_time(now.date(), "16:05")
+        return "sleep", at_time(now.date(), "16:05")
+    return "sleep", session_start(next_open.date(), auto)
+
+
 def cmd_daemon(a, paths):
+    ran = None
     while True:
         try:
             cfg, auto = load_config(paths)
@@ -728,17 +882,10 @@ def cmd_daemon(a, paths):
             b = Alpaca(paper, auto["feed"])
             c = b.clock()
             now = c["now"]
-            session_today = c["is_open"] or c["next_open"].date() == now.date()
-            start = at_time(now.date(), auto["entry_from"]) - dt.timedelta(minutes=5)
-            if session_today and now < at_time(now.date(), "16:00"):
-                if now >= start:
-                    Session(b, cfg, auto, paths, paper).run()
-                    target = at_time(now.date(), "16:05")
-                else:
-                    target = start
-            else:
-                nxt = c["next_open"].date()
-                target = at_time(nxt, auto["entry_from"]) - dt.timedelta(minutes=5)
+            action, target = daemon_plan(now, c["is_open"], c["next_open"], auto, ran)
+            if action == "run":
+                ran = now.date()
+                Session(b, cfg, auto, paths, paper).run()
             wait = max(30.0, (target - now_ny()).total_seconds())
             notify(paths, "daemon: sleeping %.0f min until %s" % (wait / 60, target.strftime("%Y-%m-%d %H:%M")), quiet=True)
             time.sleep(min(wait, 1800))
