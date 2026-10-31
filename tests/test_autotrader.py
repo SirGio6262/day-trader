@@ -42,12 +42,14 @@ class FakeBroker:
     are canceled, a cancel takes `cancel_lag` position reads to land, the flat open-orders list shows the legs
     as orders of their own, and a close is refused with "insufficient qty" while any leg still holds shares.
     `broken_qty_available` reports 0 available shares forever; `refuse_close` names symbols whose single close
-    always fails, so only close-all can liquidate them."""
+    always fails, so only close-all can liquidate them. `close_lag` makes a market close fill only after that
+    many reads of the order, like Alpaca's paper engine at the open on 2026-10-30 (up to 2 min 42 s)."""
 
-    def __init__(self, bars, cash=5000.0, cancel_lag=0, broken_qty_available=False, refuse_close=()):
+    def __init__(self, bars, cash=5000.0, cancel_lag=0, broken_qty_available=False, refuse_close=(), close_lag=0):
         self.all_bars = bars
         self.cash = cash
         self.cancel_lag = cancel_lag
+        self.close_lag = close_lag
         self.broken_qty_available = broken_qty_available
         self.refuse_close = set(refuse_close)
         self.orders = {}
@@ -97,7 +99,13 @@ class FakeBroker:
                 del self.pos[sym]
 
     def order(self, order_id):
-        return self.orders[order_id]
+        o = self.orders[order_id]
+        if o.get("close_lag"):
+            o["close_lag"] -= 1
+            if o["close_lag"] <= 0:
+                del o["close_lag"]
+                self.fill(order_id, 360.00)
+        return o
 
     def open_orders(self, symbol=None):
         return [o for o in self.orders.values() if o["status"] in ("new", "held", "partially_filled")
@@ -129,7 +137,10 @@ class FakeBroker:
             raise RuntimeError('{"code":40310000,"message":"insufficient qty available for order"}')
         o = self._new(symbol, "sell", self.pos[symbol][0], "market")
         self.closed.append(symbol)
-        self.fill(o["id"], 360.00)
+        if self.close_lag:
+            o["close_lag"] = self.close_lag
+        else:
+            self.fill(o["id"], 360.00)
         return o
 
     def close_all_positions(self):
@@ -342,6 +353,28 @@ class SessionTest(unittest.TestCase):
         sells = [r for r in at.read_json(self.paths.broker_log)["orders"] if r.get("side") == "sell"]
         self.assertEqual((sells[0]["symbol"], sells[0]["qty"], sells[0]["note"]), ("CRM", "8", "carried over"))
         self.assertLess(sells[0]["at"], at.ny_iso(t(9, 50)))   # before the first entry can trigger
+
+    def test_a_close_that_fills_after_the_confirm_wait_is_still_recorded(self):
+        # 2026-10-30: the three carried positions were closed at 09:31, Alpaca filled them 1 to 3 minutes later,
+        # the autotrader had stopped waiting after 60 s and the sells never reached the journal.
+        broker = FakeBroker({"TSLA": TSLA, "AAPL": AAPL}, close_lag=at.CONFIRM_WAIT_SECONDS // 2 + 10)
+        broker.pos["CRM"] = [8.0, 232.23]
+        clock = Clock(t(9, 46))
+        s = self.run_day(broker, clock, {})
+        self.assertEqual(broker.closed.count("CRM"), 1)          # one close, never re-sent
+        self.assertEqual(broker.positions(), [])
+        self.assertTrue(s.trades["CRM"]["exit_filled"])
+        self.assertEqual(s.trades["CRM"]["exit_by"], "flatten")
+        self.assertNotIn("close_order_id", s.trades["CRM"])
+        sells = [r for r in at.read_json(self.paths.broker_log)["orders"]
+                 if r.get("side") == "sell" and r["symbol"] == "CRM"]
+        self.assertEqual(len(sells), 1)
+        self.assertEqual((sells[0]["qty"], sells[0]["price"], sells[0]["note"]), ("8", 360.0, "carried over"))
+        self.assertLess(sells[0]["at"], at.ny_iso(t(10, 0)))    # recorded on the next poll after it filled, not at 15:55
+        log = open(self.paths.log).read()
+        self.assertIn("not confirmed filled after %d s; still watching it" % at.CONFIRM_WAIT_SECONDS, log)
+        self.assertNotIn("check the fills by hand", log)
+        self.assertIn("0 entries + 1 carried over", log)
 
     def three(self, **kw):
         """Three symbols that all break out on the same bar."""

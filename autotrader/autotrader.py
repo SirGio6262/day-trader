@@ -74,6 +74,7 @@ RELEASE_WAIT_SECONDS = 30      # how long to wait for Alpaca to free the shares 
 CLOSE_RETRY_SECONDS = 30       # how long to keep re-sending a close that Alpaca refuses as "insufficient qty"
 CONFIRM_WAIT_SECONDS = 60      # how long to wait for the close orders to report a fill
 HELD_ERROR = ("insufficient qty", "40310000")
+PENDING_CANCEL = ("pending cancel", "42210000")   # Alpaca is already canceling that order: not an error
 
 
 class AutoError(Exception):
@@ -543,7 +544,15 @@ class Session:
 
     def poll_fills(self, now):
         for sym, t in self.trades.items():
-            if "order_id" not in t or t.get("exit_filled") or t["order_id"] in NOT_OURS:
+            if "order_id" not in t or t.get("exit_filled"):
+                continue
+            if t.get("close_order_id"):
+                # A close sent earlier (a carried position at 09:31, a flatten) that did not confirm in time:
+                # keep asking until it fills, so the journal gets the sell. 2026-10-30: Alpaca's paper engine
+                # took up to 2 min 42 s to fill three market closes at the open, and the fills were lost.
+                self.check_close_order(sym, t, now)
+                continue
+            if t["order_id"] in NOT_OURS:
                 continue
             try:
                 o = self.b.order(t["order_id"])
@@ -640,7 +649,8 @@ class Session:
             try:
                 self.b.cancel(oid)
             except Exception as e:
-                self.say("%s: cancel of %s failed: %s" % (sym, oid, e), quiet=True)
+                if not any(k in str(e) for k in PENDING_CANCEL):
+                    self.say("%s: cancel of %s failed: %s" % (sym, oid, e), quiet=True)
 
     def send_closes(self, todo, why):
         """Wait until the broker frees the shares of every symbol in `todo`, closing each one as soon as it is
@@ -660,6 +670,8 @@ class Session:
                 if pos is None:
                     del pending[sym]
                     self.poll_fills(self.now_fn())
+                    if not t.get("exit_filled") and t.get("close_order_id"):
+                        self.check_close_order(sym, t, self.now_fn())
                     if not t.get("exit_filled"):
                         self.log_leg_partials(sym, t)
                         t["exit_filled"], t["note"] = True, "no position left at the broker at %s" % why
@@ -697,19 +709,39 @@ class Session:
                     continue
                 if o["status"] == "filled" and o["filled_avg_price"]:
                     del left[sym]
-                    self.log_leg_partials(sym, t)
-                    price = o["filled_avg_price"]
-                    t["exit_filled"], t["exit_price"], t["exit_by"] = True, price, "flatten"
-                    log_fill(self.paths, now, self.date, sym, "sell", int(o["filled_qty"]), price, note="%s" % why)
-                    self.say("%s: flattened at %.2f (%s), P&L $%.2f"
-                             % (sym, price, why, (price - t["entry_price"]) * o["filled_qty"]))
-                    self.save()
+                    self.record_close_fill(sym, t, o, now, why)
             if not left:
                 break
             self.sleep_fn(2)
         for sym, (t, o) in left.items():
-            t["close_order_id"] = o["id"]
-            self.say("%s: close order %s not confirmed filled after %d s; check the broker" % (sym, o["id"], CONFIRM_WAIT_SECONDS))
+            t["close_order_id"], t["close_why"] = o["id"], why
+            self.say("%s: close order %s not confirmed filled after %d s; still watching it"
+                     % (sym, o["id"], CONFIRM_WAIT_SECONDS))
+
+    def record_close_fill(self, sym, t, o, now, why):
+        """A market close filled: log the sell for the journal and mark the trade closed."""
+        self.log_leg_partials(sym, t)
+        price = o["filled_avg_price"]
+        t["exit_filled"], t["exit_price"], t["exit_by"] = True, price, "flatten"
+        t.pop("close_order_id", None)
+        log_fill(self.paths, now, self.date, sym, "sell", int(o["filled_qty"]), price, note="%s" % why)
+        self.say("%s: flattened at %.2f (%s), P&L $%.2f" % (sym, price, why, (price - t["entry_price"]) * o["filled_qty"]))
+        self.save()
+
+    def check_close_order(self, sym, t, now):
+        """Look at a close order that was not confirmed within CONFIRM_WAIT_SECONDS. Filled: record it.
+        Canceled, expired or rejected: forget it, so the next flatten sends a new close."""
+        try:
+            o = self.b.order(t["close_order_id"])
+        except Exception as e:
+            self.say("%s: could not read close order %s: %s" % (sym, t["close_order_id"], e), quiet=True)
+            return
+        if o["status"] == "filled" and o["filled_avg_price"]:
+            self.record_close_fill(sym, t, o, now, t.get("close_why", "flatten"))
+        elif o["status"] in ("canceled", "expired", "rejected"):
+            self.say("%s: close order %s %s; it will be closed again" % (sym, o["id"], o["status"]))
+            t.pop("close_order_id", None)
+            self.save()
 
     def log_leg_partials(self, sym, t):
         """A stop or target that filled only in part before the flatten still sold shares: the journal needs it."""
@@ -798,7 +830,10 @@ class Session:
     def summary(self):
         done = [t for t in self.trades.values() if t.get("entry_filled")]
         pnl = sum((t.get("exit_price", t["entry_price"]) - t["entry_price"]) * t.get("filled_qty", t["qty"]) for t in done)
-        self.say("%s done: %d entr%s, P&L $%.2f" % (self.date, len(done), "y" if len(done) == 1 else "ies", pnl))
+        entries = [t for t in done if t["order_id"] not in NOT_OURS]
+        carried = len(done) - len(entries)
+        self.say("%s done: %d entr%s%s, P&L $%.2f" % (self.date, len(entries), "y" if len(entries) == 1 else "ies",
+                                                     " + %d carried over" % carried if carried else "", pnl))
         journal = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".claude", "skills",
                                "trader-journal", "journal.py")
         if os.path.exists(journal):
