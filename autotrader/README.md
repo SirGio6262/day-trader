@@ -26,9 +26,11 @@ What it does, in order, every trading day (New York time):
 5. 15:55: cancels the legs of every open trade, waits (up to 30 s, for
    all symbols at once) until Alpaca frees the shares they hold, sends one
    market close per symbol (re-sent for up to 30 s more while Alpaca still
-   answers "insufficient qty"), and waits up to 60 s for the fills. The
-   whole flatten takes about two minutes at worst, however many positions
-   are open. If a symbol still cannot be closed, Alpaca's close-all
+   answers "insufficient qty"), and waits up to 60 s for the fills. A
+   close that has not filled by then is kept and polled until it does
+   (Alpaca's paper engine took almost three minutes at the open once), so
+   the sell always reaches the journal. The whole flatten takes about two
+   minutes at worst, however many positions are open. If a symbol still cannot be closed, Alpaca's close-all
    (cancel every order, liquidate everything) is the last resort; a
    partially filled entry is closed for what filled.
 6. Prints the journal report and sends it to Telegram if configured.
