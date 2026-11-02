@@ -215,6 +215,44 @@ def plan_for(bar, orr, target_r, min_stop_pct):
             "reward_risk": round((target - entry) / risk, 2), "bar_time": hm(bar["t"])}, None
 
 
+# ---------------------------------------------------------------- features (recorded, never acted on)
+
+def entry_features(bars, bar, orr, prev_close=None):
+    """What the chart looked like when the rule fired, as numbers. Recorded with every entry so that, once the
+    journal has its 60 trades, filters (volume, gap, range width...) can be tested on the real record instead of
+    chosen beforehand. Nothing here changes a trade: the rule is still the bar close above the range high."""
+    before = sorted([b for b in bars if b["t"] < bar["t"]], key=lambda x: x["t"])
+    per_bar = orr["volume"] / orr["bars"] if orr.get("bars") else 0.0
+    range_end = before[0]["t"] + dt.timedelta(minutes=5 * orr.get("bars", 0)) if before else None
+    rng = bar["h"] - bar["l"]
+    f = {"or_width_pct": round((orr["high"] - orr["low"]) / orr["mid"] * 100, 3),
+         "or_volume": orr["volume"],
+         "bar_volume": bar["v"],
+         "bar_rel_volume": round(bar["v"] / per_bar, 3) if per_bar else None,
+         "break_pct": round((bar["c"] - orr["high"]) / orr["high"] * 100, 3),
+         "bar_range_pct": round(rng / bar["c"] * 100, 3),
+         "close_in_bar": round((bar["c"] - bar["l"]) / rng, 3) if rng > 0 else None,
+         "minutes_after_range": int((bar["t"] - range_end).total_seconds() // 60) if before else None,
+         "volume_before": sum(b["v"] for b in before),
+         "gap_pct": None}
+    if prev_close and before:
+        f["gap_pct"] = round((before[0]["o"] - prev_close) / prev_close * 100, 3)
+    return f
+
+
+def excursion(bars, entry_price, stop, start, end):
+    """How far the price went for and against the trade while it was open, in R: the most favourable (mfe_r) and
+    most adverse (mae_r) excursion over the completed 5-minute bars between `start` and `end`. For exit rules:
+    a trade that reached 1.5R and then stopped out is a different animal from one that never got there."""
+    risk = entry_price - stop
+    inside = [b for b in bars if start <= b["t"] < end]
+    if risk <= 0 or not inside:
+        return None
+    return {"mfe_r": round((max(b["h"] for b in inside) - entry_price) / risk, 3),
+            "mae_r": round((entry_price - min(b["l"] for b in inside)) / risk, 3),
+            "bars": len(inside)}
+
+
 def size_order(cfg, entry, stop, cash):
     """Whole shares inside every limit; (qty, the limit that decided, lines)."""
     risk = entry - stop
@@ -302,7 +340,7 @@ def append_log(paths, rec):
     write_json(paths.broker_log, log)
 
 
-def log_placed(paths, now, date, symbol, qty, plan, max_loss, broker_id, paper, client_id):
+def log_placed(paths, now, date, symbol, qty, plan, max_loss, broker_id, paper, client_id, features=None):
     plain = ("BUY %d %s, market, good for today / stop-loss %.2f / take-profit %.2f / max loss about $%.2f "
              "if the stop fills at %.2f" % (qty, symbol, plan["stop"], plan["target"], max_loss, plan["stop"]))
     for status in ("approved", "placed"):
@@ -315,15 +353,19 @@ def log_placed(paths, now, date, symbol, qty, plan, max_loss, broker_id, paper, 
                 plan["bar_time"], plan["entry"], plan.get("or_minutes", 15), plan["or_high"])
         else:
             rec["broker_order_id"] = broker_id
+            if features:
+                rec["features"] = features
         append_log(paths, rec)
 
 
-def log_fill(paths, now, date, symbol, side, qty, price, note=None):
+def log_fill(paths, now, date, symbol, side, qty, price, note=None, extra=None):
     rec = {"at": ny_iso(now), "date": date, "status": "filled", "symbol": symbol, "side": side, "qty": str(qty),
            "price": float(price), "plain": "%s %s %s at %.2f" % (side.upper(), qty, symbol, float(price)),
            "source": "autotrader"}
     if note:
         rec["note"] = note
+    if extra:
+        rec.update(extra)
     append_log(paths, rec)
 
 
@@ -385,6 +427,18 @@ class Alpaca:
             out[sym] = [{"t": b.timestamp.astimezone(NY), "o": float(b.open), "h": float(b.high), "l": float(b.low),
                          "c": float(b.close), "v": float(b.volume)} for b in bars]
         return out
+
+    def prev_closes(self, symbols, day):
+        """The last daily close before `day`, per symbol: one request, for the gap feature only."""
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        from alpaca.data.enums import DataFeed
+        start = dt.datetime.combine(day - dt.timedelta(days=7), dt.time(0, 0), tzinfo=NY)
+        end = dt.datetime.combine(day, dt.time(0, 0), tzinfo=NY)
+        req = StockBarsRequest(symbol_or_symbols=list(symbols), timeframe=TimeFrame.Day, feed=DataFeed(self.feed),
+                               start=start.astimezone(dt.timezone.utc), end=end.astimezone(dt.timezone.utc))
+        bs = self.data.get_stock_bars(req)
+        return {sym: float(bars[-1].close) for sym, bars in bs.data.items() if bars}
 
     def submit_bracket(self, symbol, qty, stop, target, client_id):
         from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
@@ -468,6 +522,7 @@ class Session:
         self.close = at_time(self.day, "16:00")
         self.state = read_json(paths.state) or {}
         self.trades = self.state.setdefault(self.date, {})   # symbol -> dict
+        self.prev_close = None      # symbol -> yesterday's close, fetched once, for the gap feature
 
     def save(self):
         write_json(self.paths.state, self.state)
@@ -501,11 +556,35 @@ class Session:
                                self.auto["min_bar_volume"])
             if bar:
                 strength = (bar["c"] - orr["high"]) / orr["high"]
-                hits.append((strength, sym, bar, orr))
-        for _, sym, bar, orr in sorted(hits, key=lambda x: -x[0]):
-            self.try_entry(sym, bar, orr, now)
+                hits.append((strength, sym, bar, orr, sb))
+        for _, sym, bar, orr, sb in sorted(hits, key=lambda x: -x[0]):
+            self.try_entry(sym, bar, orr, now, self.features_for(sym, sb, bar, orr))
 
-    def try_entry(self, sym, bar, orr, now):
+    def features_for(self, sym, sb, bar, orr):
+        """The entry features, never a reason to skip a trade: any failure here gives None and the entry goes on."""
+        try:
+            if self.prev_close is None:
+                try:
+                    self.prev_close = self.b.prev_closes(self.auto["symbols"], self.day)
+                except Exception as e:
+                    self.prev_close = {}
+                    self.say("previous closes not available (%s); gap feature left empty today" % e, quiet=True)
+            return entry_features(sb, bar, orr, self.prev_close.get(sym))
+        except Exception as e:
+            self.say("%s: features failed: %s" % (sym, e), quiet=True)
+            return None
+
+    def excursion_for(self, sym, t, now):
+        """MFE and MAE in R from the entry bar's close to now, read once at the exit; None if anything fails."""
+        try:
+            start = at_time(self.day, t["plan"]["bar_time"]) + dt.timedelta(minutes=5)
+            bars = self.b.bars([sym], start, now).get(sym) or []
+            return excursion(bars, float(t["entry_price"]), float(t["stop"]), start, now)
+        except Exception as e:
+            self.say("%s: excursion failed: %s" % (sym, e), quiet=True)
+            return None
+
+    def try_entry(self, sym, bar, orr, now, features=None):
         plan, why = plan_for(bar, orr, self.auto["target_r"], self.auto["min_stop_distance_pct"])
         if plan is None:
             self.trades[sym] = {"skipped": why, "at": ny_iso(now)}
@@ -533,9 +612,9 @@ class Session:
             return
         self.trades[sym] = {"order_id": o["id"], "client_order_id": client_id, "qty": qty, "stop": plan["stop"],
                             "target": plan["target"], "max_loss": max_loss, "plan": plan, "placed_at": ny_iso(now),
-                            "entry_filled": False, "exit_filled": False}
+                            "entry_filled": False, "exit_filled": False, "features": features}
         self.save()
-        log_placed(self.paths, now, self.date, sym, qty, plan, max_loss, o["id"], self.paper, client_id)
+        log_placed(self.paths, now, self.date, sym, qty, plan, max_loss, o["id"], self.paper, client_id, features)
         self.say("%s: BUY %d at ~%.2f, stop %.2f, target %.2f, max loss $%.2f (size by %s). %s"
                  % (sym, qty, plan["entry"], plan["stop"], plan["target"], max_loss, limit,
                     "PAPER" if self.paper else "LIVE"))
@@ -574,8 +653,9 @@ class Session:
                 if leg["status"] == "filled" and leg["filled_avg_price"] and leg["filled_qty"] > 0:
                     which = "stop" if leg.get("type") in ("stop", "stop_limit") else "target"
                     t["exit_filled"], t["exit_price"], t["exit_by"] = True, leg["filled_avg_price"], which
+                    t["excursion"] = self.excursion_for(sym, t, now)
                     log_fill(self.paths, now, self.date, sym, "sell", int(leg["filled_qty"]), leg["filled_avg_price"],
-                             note="%s filled" % which)
+                             note="%s filled" % which, extra={"excursion": t["excursion"]} if t["excursion"] else None)
                     pnl = (leg["filled_avg_price"] - t["entry_price"]) * leg["filled_qty"]
                     self.say("%s: %s filled at %.2f, P&L $%.2f" % (sym, which, leg["filled_avg_price"], pnl))
                     self.save()
@@ -724,7 +804,9 @@ class Session:
         price = o["filled_avg_price"]
         t["exit_filled"], t["exit_price"], t["exit_by"] = True, price, "flatten"
         t.pop("close_order_id", None)
-        log_fill(self.paths, now, self.date, sym, "sell", int(o["filled_qty"]), price, note="%s" % why)
+        t["excursion"] = self.excursion_for(sym, t, now) if "plan" in t else None
+        log_fill(self.paths, now, self.date, sym, "sell", int(o["filled_qty"]), price, note="%s" % why,
+                 extra={"excursion": t["excursion"]} if t["excursion"] else None)
         self.say("%s: flattened at %.2f (%s), P&L $%.2f" % (sym, price, why, (price - t["entry_price"]) * o["filled_qty"]))
         self.save()
 
