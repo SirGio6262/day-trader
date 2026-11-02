@@ -45,8 +45,10 @@ class FakeBroker:
     always fails, so only close-all can liquidate them. `close_lag` makes a market close fill only after that
     many reads of the order, like Alpaca's paper engine at the open on 2026-10-30 (up to 2 min 42 s)."""
 
-    def __init__(self, bars, cash=5000.0, cancel_lag=0, broken_qty_available=False, refuse_close=(), close_lag=0):
+    def __init__(self, bars, cash=5000.0, cancel_lag=0, broken_qty_available=False, refuse_close=(), close_lag=0,
+                 prev_closes=None):
         self.all_bars = bars
+        self.prev = prev_closes or {}
         self.cash = cash
         self.cancel_lag = cancel_lag
         self.close_lag = close_lag
@@ -66,6 +68,9 @@ class FakeBroker:
 
     def bars(self, symbols, start, end=None):
         return {s: [b for b in self.all_bars.get(s, []) if b["t"] >= start and (end is None or b["t"] < end)] for s in symbols}
+
+    def prev_closes(self, symbols, day):
+        return {s: self.prev[s] for s in symbols if s in self.prev}
 
     def _new(self, symbol, side, qty, typ, status="new"):
         self.n += 1
@@ -204,6 +209,26 @@ class RuleTest(unittest.TestCase):
         plan2, _ = at.plan_for(TSLA[8], orr, 2.0, 0.15)
         self.assertEqual(plan2["target"], 375.9)
 
+    def test_entry_features_describe_the_breakout(self):
+        orr = at.opening_range(TSLA, 15, t(9, 30))
+        f = at.entry_features(TSLA, TSLA[8], orr, prev_close=350.0)
+        self.assertEqual(f["or_width_pct"], round(7.71 / 358.32 * 100, 3))
+        self.assertEqual((f["or_volume"], f["bar_volume"], f["bar_rel_volume"]), (300000, 100000, 1.0))
+        self.assertEqual(f["break_pct"], round(2.0 / 362.18 * 100, 3))
+        self.assertEqual(f["bar_range_pct"], round(2.7 / 364.18 * 100, 3))
+        self.assertEqual(f["close_in_bar"], round(2.38 / 2.7, 3))
+        self.assertEqual(f["minutes_after_range"], 25)          # 10:10 bar, range ended 09:45
+        self.assertEqual(f["volume_before"], 800000)
+        self.assertEqual(f["gap_pct"], round(6.0 / 350.0 * 100, 3))
+        self.assertIsNone(at.entry_features(TSLA, TSLA[8], orr)["gap_pct"])
+
+    def test_excursion_in_r(self):
+        # entry 364.20, stop 358.32 (risk 5.88); only the 10:15 bar (h 366, l 363.5) sits between 10:15 and 11:40
+        x = at.excursion(TSLA, 364.20, 358.32, t(10, 15), t(11, 40))
+        self.assertEqual(x, {"mfe_r": round(1.8 / 5.88, 3), "mae_r": round(0.7 / 5.88, 3), "bars": 1})
+        self.assertIsNone(at.excursion(TSLA, 364.20, 358.32, t(12, 0), t(13, 0)))
+        self.assertIsNone(at.excursion(TSLA, 358.0, 358.32, t(10, 15), t(11, 40)))   # stop above entry: no R
+
     def test_plan_refuses_a_stop_too_tight(self):
         orr = {"high": 100.0, "low": 99.9, "mid": 99.95}
         plan, why = at.plan_for({"t": t(10, 10), "c": 100.01, "v": 1}, orr, 2.0, 0.15)
@@ -294,7 +319,7 @@ class SessionTest(unittest.TestCase):
         return s
 
     def test_a_full_day_target_hit(self):
-        broker = FakeBroker({"TSLA": TSLA, "AAPL": AAPL})
+        broker = FakeBroker({"TSLA": TSLA, "AAPL": AAPL}, prev_closes={"TSLA": 350.0})
         clock = Clock(t(9, 46))
 
         def fill_entry(b, s):
@@ -320,6 +345,15 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(still_open, {})
         self.assertAlmostEqual(trades[0]["r"], (370.04 - 364.20) / (364.20 - 358.32), places=2)
         self.assertEqual(trades[0]["stop"], 358.32)
+        # The features and the excursion are recorded, on the trade and in the broker log, and change nothing else.
+        f = s.trades["TSLA"]["features"]
+        self.assertEqual((f["minutes_after_range"], f["bar_rel_volume"], f["gap_pct"]), (25, 1.0, round(6.0 / 350.0 * 100, 3)))
+        placed = [r for r in log["orders"] if r["status"] == "placed"][0]
+        self.assertEqual(placed["features"], f)
+        x = s.trades["TSLA"]["excursion"]
+        self.assertEqual(x, {"mfe_r": round(1.8 / 5.88, 3), "mae_r": round(0.7 / 5.88, 3), "bars": 1})
+        sell = [r for r in log["orders"] if r["status"] == "filled" and r["side"] == "sell"][0]
+        self.assertEqual(sell["excursion"], x)
 
     def test_flat_by_closes_what_is_still_open(self):
         broker = FakeBroker({"TSLA": TSLA})

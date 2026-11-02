@@ -138,6 +138,24 @@ process). Then: live keys in the env file, `ALPACA_PAPER_TRADE=false`,
 `"paper": false` in the config, the same `max_loss_per_trade_usd`, restart
 the service, and 60 more trades before `report --live` says anything.
 
+## What it records besides the fills
+
+Every entry carries a `features` block, on the trade in
+`trader/state/autotrader.json` and on the `placed` record in `broker.json`:
+the opening range's width in percent and its volume, the breakout bar's
+volume and its ratio to the range's average bar, how far the close sat
+above the range high, the bar's own range and where the close sat inside
+it, the minutes since the range ended, the volume traded before the bar,
+and the gap from the previous close (one daily-bars request per day; empty
+if it fails). Every exit carries an `excursion` block: the most favourable
+and most adverse move in R between the entry bar's close and the exit.
+
+None of it is acted on. The rule stays the bar close above the range high.
+The point is that once the journal has its 60 trades, a filter (volume, gap,
+range width) or an exit rule (trail after 1R, time stop) can be tested on
+the real record, not picked beforehand. A failure anywhere in this code
+leaves the field empty and the trade goes on.
+
 ## Known limits
 
 - IEX-only bars can differ from the consolidated tape; a breakout on IEX
