@@ -62,7 +62,11 @@ budget, and the worst losing streak. Then the same per symbol and per setup.
 Read them like this. The t-statistic says whether the mean is
 distinguishable from zero given the scatter: at t = 1 a mean of +0.2 R is
 noise, at t = 2.5 it is probably real. The confidence interval says how
-wrong the mean may still be. The profit factor says what the dollar edge
+wrong the mean may still be. The "by day" line runs the same test on the
+sum of R per trading day: breakouts taken the same morning rise and fall
+together, so the per-trade t counts them as independent when they are not
+and overstates the evidence. When the two disagree, trust the smaller one.
+The gate still uses the per-trade t. The profit factor says what the dollar edge
 looks like after the costs. The drawdown says what it felt like to live
 through it, and what a live run should expect to feel.
 

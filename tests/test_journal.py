@@ -111,6 +111,26 @@ class JournalTest(unittest.TestCase):
         self.assertEqual(s["max_consecutive_losses"], 2)
         self.assertIsNotNone(s["t_r"])
 
+    def test_t_by_day_counts_days_not_trades(self):
+        # Two days, each with three trades that all win or all lose together.
+        trades = [journal.trade("X", d, 10, 100, 100 + dx, 99, 0.0, "journal")
+                  for d, dx in [("2026-10-01", 2)] * 3 + [("2026-10-02", -1)] * 3
+                  + [("2026-10-05", 2)] * 3 + [("2026-10-06", 1)] * 3]
+        s = journal.stats(trades)
+        self.assertEqual(s["days"], 4)
+        self.assertAlmostEqual(s["r_per_day"], (6 - 3 + 6 + 3) / 4, places=3)
+        daily = [6, -3, 6, 3]
+        m = sum(daily) / 4
+        se = (sum((x - m) ** 2 for x in daily) / 3) ** 0.5 / 2
+        self.assertAlmostEqual(s["t_day"], round(m / se, 2), places=2)
+        self.assertLess(s["t_day"], s["t_r"])   # 12 correlated trades are 4 observations
+
+    def test_t_by_day_needs_two_days(self):
+        trades = [journal.trade("X", "2026-10-01", 10, 100, 102, 99, 0.0, "journal")] * 3
+        s = journal.stats(trades)
+        self.assertEqual(s["days"], 1)
+        self.assertIsNone(s["t_day"])
+
     # ---- the gate
 
     def test_verdict_not_yet_under_the_sample_size(self):
