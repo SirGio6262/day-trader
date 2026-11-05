@@ -222,6 +222,7 @@ def stats(trades, budget=None):
          "profit_factor": (round(gross_win / gross_loss, 3) if gross_loss > 0 else None),
          "expectancy_r": (round(_mean(rs), 3) if rs else None), "sd_r": None, "se_r": None, "t_r": None,
          "ci95_r": None, "avg_win_r": None, "avg_loss_r": None,
+         "days": 0, "r_per_day": None, "sd_day_r": None, "se_day_r": None, "t_day": None,
          "max_drawdown": 0.0, "max_drawdown_pct": None, "max_consecutive_losses": 0}
     if rs:
         wr = [r for r in rs if r > 0]
@@ -236,6 +237,24 @@ def stats(trades, budget=None):
             if se > 0:
                 s["t_r"] = round(_mean(rs) / se, 2)
                 s["ci95_r"] = [round(_mean(rs) - 1.96 * se, 3), round(_mean(rs) + 1.96 * se, 3)]
+    # The same test on the sum of R per trading day. Trades taken the same
+    # morning move together, so the per-trade t counts correlated trades as
+    # independent and overstates the evidence; days are close to independent.
+    by_day = {}
+    for t in trades:
+        if t["r"] is not None:
+            by_day[t["date"]] = by_day.get(t["date"], 0.0) + t["r"]
+    dr = list(by_day.values())
+    s["days"] = len(dr)
+    if dr:
+        s["r_per_day"] = round(_mean(dr), 3)
+        sd = _sd(dr)
+        if sd is not None:
+            s["sd_day_r"] = round(sd, 3)
+            se = sd / math.sqrt(len(dr))
+            s["se_day_r"] = round(se, 4)
+            if se > 0:
+                s["t_day"] = round(_mean(dr) / se, 2)
     peak = cum = 0.0
     dd = 0.0
     streak = worst = 0
@@ -271,8 +290,8 @@ def verdict(s, gate, budget=None):
     if n < gate["min_trades"]:
         reasons.append("%d closed trade%s; the gate needs %d before any verdict" % (n, "" if n == 1 else "s", gate["min_trades"]))
         if s["expectancy_r"] is not None:
-            reasons.append("so far: mean R %s, t = %s, profit factor %s"
-                           % (s["expectancy_r"], _na(s["t_r"]), _na(s["profit_factor"])))
+            reasons.append("so far: mean R %s, t = %s (by day %s), profit factor %s"
+                           % (s["expectancy_r"], _na(s["t_r"]), _na(s["t_day"]), _na(s["profit_factor"])))
         return "NOT YET", reasons
     ok = True
     if s["with_r"] < n:
@@ -349,6 +368,11 @@ def cmd_report(a):
                     line += ", 95%% CI [%s, %s]" % (ci[0], ci[1])
             print(line)
             print("  average win %s R, average loss %s R" % (_na(s["avg_win_r"]), _na(s["avg_loss_r"])))
+            if s["days"] > 1:
+                line = "  by day: %d trading days, %s R a day" % (s["days"], s["r_per_day"])
+                if s["sd_day_r"] is not None:
+                    line += "; sd %s, standard error %s, t = %s" % (s["sd_day_r"], s["se_day_r"], s["t_day"])
+                print(line)
         dd = "  max drawdown %s" % _money(s["max_drawdown"])
         if s["max_drawdown_pct"] is not None:
             dd += " (%s%% of the %s budget)" % (s["max_drawdown_pct"], _money(budget))
