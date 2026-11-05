@@ -105,6 +105,13 @@ writing takes effect (a STOP, or a filter adopted from a backtest), and
 the paper count starts again from zero. Never move it to drop a bad
 stretch of the same rule: that is lowering the gate.
 
+`exclude` (optional) is the other way to apply a new rule: it carries the
+old trades into the new sample and drops only the ones the new rule would
+have refused. Each entry is `{"date": "YYYY-MM-DD", "symbol": "XOM",
+"why": "..."}`, a reason is required, and the report lists every exclusion
+with its R. Exclude every old trade the new rule refuses, and only those.
+Picking out losers the rule would still have taken is lowering the gate.
+
 GO means one thing: trade live at the **same dollar risk per trade** as the
 paper run for the next `min_trades` trades, then `report --live` and
 compare the two. It never means more size, more trades a day, or a second

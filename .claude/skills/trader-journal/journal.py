@@ -195,7 +195,41 @@ def all_trades(a, cfg, paper_only):
     since = count_from(cfg)
     if since:
         trades = [t for t in trades if str(t["date"]) >= since]
+    rules = excluded(cfg)
+    trades = [t for t in trades if (str(t["date"]), t["symbol"].upper()) not in rules]
     return trades, still_open, cost_rt
+
+
+def excluded(cfg):
+    """journal.exclude: [{"date": "YYYY-MM-DD", "symbol": "XOM", "why": "..."}]. Trades the CURRENT rule would
+    not have taken, kept in the record but out of the sample. Every entry needs a reason, and the report prints
+    each one, so the sample is never cut silently. Use it only when a rule change is applied back to old trades
+    mechanically (every trade the new rule refuses, none it accepts); never to drop a loser the rule would take."""
+    out = {}
+    for e in (cfg.get("journal") or {}).get("exclude") or []:
+        d, sym, why = str(e.get("date", "")).strip(), str(e.get("symbol", "")).strip().upper(), str(e.get("why", "")).strip()
+        datetime.date.fromisoformat(d)
+        if not sym or not why:
+            raise ValueError("journal.exclude entry %r needs a symbol and a why" % (e,))
+        out[(d, sym)] = why
+    return out
+
+
+def excluded_lines(cfg, a, paper_only):
+    """The exclusions as report lines, each marked with whether it matched a closed trade."""
+    rules = excluded(cfg)
+    if not rules:
+        return []
+    cost_rt = gate_from(cfg)["cost_per_share_round_trip"]
+    log_trades, _ = trades_from_broker_log(read_json(a.state, "broker log", required=False) or {}, cost_rt, paper_only)
+    manual = trades_from_journal(read_json(a.journal, "journal", required=False), cost_rt, paper_only)
+    seen = {(str(t["date"]), t["symbol"].upper()): t for t in log_trades + manual}
+    out = []
+    for (d, sym), why in sorted(rules.items()):
+        t = seen.get((d, sym))
+        out.append("%s %s%s: %s" % (d, sym, (" (%s R)" % t["r"]) if t and t.get("r") is not None else
+                                    ("" if t else " (matches no closed trade)"), why))
+    return out
 
 
 def count_from(cfg):
@@ -358,6 +392,7 @@ def cmd_report(a):
     label = {True: "paper", False: "live", None: "paper and live"}[paper_only]
     if a.json:
         print(json.dumps({"scope": label, "cost_per_share_round_trip": cost_rt, "count_from": count_from(cfg) or None,
+                          "excluded": excluded_lines(cfg, a, paper_only),
                           "gate": gate, "stats": s,
                           "by_symbol": by_key(trades, "symbol"), "by_setup": by_key(trades, "setup"),
                           "still_open": still_open, "verdict": v, "reasons": reasons}, indent=2))
@@ -395,6 +430,11 @@ def cmd_report(a):
         bs = by_key(trades, "symbol")
         if len(bs) > 1:
             print("  by symbol: " + "; ".join("%s %d trades, %s R" % (k, v["trades"], v["expectancy_r"]) for k, v in bs.items()))
+    ex = excluded_lines(cfg, a, paper_only)
+    if ex:
+        print("  excluded by journal.exclude (%d, not counted):" % len(ex))
+        for line in ex:
+            print("    " + line)
     if still_open:
         print("  still open (not counted): " + ", ".join("%s x%s" % (k, v) for k, v in still_open.items()))
     print("Verdict: %s" % v)

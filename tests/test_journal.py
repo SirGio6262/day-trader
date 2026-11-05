@@ -216,6 +216,25 @@ class JournalTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             journal.count_from({"journal": {"count_from": "2026-11-6x"}})
 
+    def test_exclude_drops_named_trades_and_says_why(self):
+        for sym, d, ex in (("A", "2026-10-19", 11), ("B", "2026-11-05", 9), ("C", "2026-11-05", 9)):
+            run(["add"] + self.common() + ["--symbol", sym, "--date", d, "--qty", "1", "--entry", "10",
+                                           "--exit", str(ex), "--stop", "9"])
+        cfg = {"budget": 5000, "journal": {"cost_per_share_round_trip": 0.0, "exclude": [
+            {"date": "2026-11-05", "symbol": "b", "why": "market filter: SPY under its range low"},
+            {"date": "2026-11-05", "symbol": "C", "why": "market filter: SPY under its range low"}]}}
+        with open(self.config, "w") as fh:
+            json.dump(cfg, fh)
+        _, out, _ = run(["report", "--json"] + self.common())
+        doc = json.loads(out)
+        self.assertEqual(doc["stats"]["trades"], 1)
+        self.assertEqual(len(doc["excluded"]), 2)
+        self.assertTrue(all("-1.0 R" in x for x in doc["excluded"]), doc["excluded"])
+        _, out, _ = run(["report"] + self.common())
+        self.assertIn("excluded by journal.exclude (2, not counted)", out)
+        with self.assertRaises(ValueError):
+            journal.excluded({"journal": {"exclude": [{"date": "2026-11-05", "symbol": "B"}]}})   # no why
+
     def test_list_with_nothing(self):
         code, out, _ = run(["list"] + self.common())
         self.assertEqual(code, 1)
