@@ -117,6 +117,25 @@ gate; it comes down the day a live drawdown passes the bar.
 4. If fills are missing (a sell without a buy, a position still open at
    night), say so: the journal lists what is still open.
 
+## The nightly review (`review.py`)
+
+After the close, one note a day in `trader/reviews/YYYY-MM-DD.md` (Russian,
+numbers first) plus a `.json` snapshot the next night diffs against:
+
+```bash
+python3 .claude/skills/trader-journal/review.py pull   # read-only scp of the VPS broker.json and config.json to trader/vps/
+python3 .claude/skills/trader-journal/review.py run    # today, New York date
+```
+
+It prints the day's trades, the change in n, expectancy, t, win rate,
+profit factor, drawdown, losing streak and verdict since the last note, and
+the one biggest gap in R: a symbol, an entry-time bucket, one half of an
+entry feature, or trades that reached +1R (MFE) and still lost. Every group
+is scored as n x (mean R of the rest - mean R of the group). At most one
+proposal, written as a config diff and never applied; under 30 closed
+trades, or for anything the config cannot express, it is a hypothesis for
+`autotrader/backtest.py`. A proposal never touches the `journal` block.
+
 ## What it never does
 
 - Never counts a trade that is not closed, and never guesses an exit.
