@@ -117,8 +117,13 @@ network policy allows them. The daily run happens on Sergey's own machine.
   per trade against a 0.1 R gate; half of Bitcoin's daily variance sits in
   US hours anyway and weekend volatility runs at 0.6 of weekdays. Keep
   `"allow_crypto": false` and `"allow_options": false`. A crypto adaptation,
-  if ever, is a separate branch and only after the stock version passes the
-  journal gate.
+  if ever, trades only after the stock version passes the journal gate.
+- **2026-11-04, crypto is a separate project.** All crypto work (research,
+  backtests, data, any executor) lives in
+  `/Users/sergeynedossekin/crypto-day-trading`, its own repository. Never
+  in this repo: no crypto files, branches or data here. The only crypto in
+  this repo is the guards that keep it out (`allow_crypto`, trader-risk,
+  this decision).
 - **2026-10-28, unattended execution on a VPS.** Sergey cannot watch the
   session, so orders are placed by `autotrader/autotrader.py`, a
   deterministic Python process, not by Claude. Claude never places orders
