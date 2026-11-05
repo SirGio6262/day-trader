@@ -60,7 +60,9 @@ optional `autotrader` block:
   "min_stop_distance_pct": 0.15,
   "poll_seconds": 15,
   "feed": "iex",
-  "use_scanner_watchlist": false
+  "use_scanner_watchlist": false,
+  "market_filter": "",
+  "market_symbol": "SPY"
 }
 ```
 
@@ -69,6 +71,34 @@ exchange only, 200 calls a minute). `sip` is the full tape and needs the
 $99 a month Algo Trader Plus plan; consider it only after the journal gate.
 `use_scanner_watchlist: true` reads `trader/watchlist.json` from
 `/trader-scanner daily` if you run the scanner pre-market by cron.
+
+`market_filter: "spy_below_range_low"` skips a breakout when, on the same
+5-minute bar that gave the signal, `market_symbol` closed under the low
+of its own opening range. The log says `SYM: SKIP (market filter: ...)`,
+and that symbol is done for the day: the rule is the first breakout or
+nothing. `backtest.py run` applies the same filter when the config sets
+it, and `fetch` then also gets the market symbol's bars. The default is
+off (`""`).
+
+Why it exists (Alpaca IEX 5-minute bars, 2020-07-27 to 2026-11-04,
+1,577 sessions, the 20 default symbols, R net of $0.02 a share):
+
+| long signals | n | mean R |
+| --- | ---: | ---: |
+| SPY under its range low at the signal | 1,136 | -0.079 |
+| every other signal | 11,415 | +0.039 |
+
+The difference is -0.118 R, with a day-block bootstrap standard error of
+0.046 (z -2.6, 95 % interval -0.21 to -0.02). It has the same sign in all
+seven years, in 16 of the 20 symbols, and in both halves of the sample.
+With the daily limits (5 trades, $150 a day) the filter moves the rule
+from +0.011 R a trade (t by day 0.56) to +0.031 R (t by day 1.56). It
+removes the worst trades, but it does not make an edge: +0.03 R is about
+the size of the costs the backtest leaves out (paper stops filled 0.04 R
+past the stop on average through 2026-11-05; the backtest fills a stop at
+the stop). The journal still decides. Adopting
+the filter is a rule change, so set `journal.count_from` to the first
+day it trades, and the paper count starts again from zero.
 
 ## VPS setup (Ubuntu 24.04, any $5-10 a month box)
 

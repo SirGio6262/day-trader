@@ -98,6 +98,13 @@ The verdict, in order:
    `min_profit_factor`, drawdown within `max_drawdown_pct` of the budget.
    Any bar missed is NOT YET, with the reason.
 
+`count_from` (optional, `"YYYY-MM-DD"`) is the day the current rule began.
+Trades before it were made under another rule, so they are a different
+setup's sample and are not counted. Set it the day a rule change in
+writing takes effect (a STOP, or a filter adopted from a backtest), and
+the paper count starts again from zero. Never move it to drop a bad
+stretch of the same rule: that is lowering the gate.
+
 GO means one thing: trade live at the **same dollar risk per trade** as the
 paper run for the next `min_trades` trades, then `report --live` and
 compare the two. It never means more size, more trades a day, or a second

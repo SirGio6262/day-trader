@@ -165,6 +165,22 @@ class FakeBroker:
         return [{"symbol": s, "qty": q, "avg_entry_price": p} for s, (q, p) in self.pos.items()]
 
 
+# SPY on the same day: range 600.00-603.00. MARKET_WEAK closes under 600.00 from the 10:00 bar on; MARKET_OK never does.
+def spy(closes):
+    rows = [bar(9, 30, 601, 603, 600, 602), bar(9, 35, 602, 602.5, 601, 601.5), bar(9, 40, 601.5, 602, 600.5, 601)]
+    h, m = 9, 45
+    for c in closes:
+        rows.append(bar(h, m, c, c + 0.5, c - 0.5, c))
+        m += 5
+        if m == 60:
+            h, m = h + 1, 0
+    return rows
+
+
+MARKET_WEAK = spy([601, 600.5, 600.2, 599.5, 599.0, 598.6, 598.0, 597.5])
+MARKET_OK = spy([601, 601.5, 602, 602.5, 603, 603.4, 604, 604.2])
+
+
 class Clock:
     def __init__(self, start):
         self.now = start
@@ -228,6 +244,17 @@ class RuleTest(unittest.TestCase):
         self.assertEqual(x, {"mfe_r": round(1.8 / 5.88, 3), "mae_r": round(0.7 / 5.88, 3), "bars": 1})
         self.assertIsNone(at.excursion(TSLA, 364.20, 358.32, t(12, 0), t(13, 0)))
         self.assertIsNone(at.excursion(TSLA, 358.0, 358.32, t(10, 15), t(11, 40)))   # stop above entry: no R
+
+    def test_market_check(self):
+        so = t(9, 30)
+        self.assertEqual(at.market_check("", [], t(10, 10), 15, so), ("ok", None))
+        v, why = at.market_check("spy_below_range_low", MARKET_WEAK, t(10, 10), 15, so)
+        self.assertEqual(v, "skip")
+        self.assertIn("below its range low 600.00", why)
+        self.assertEqual(at.market_check("spy_below_range_low", MARKET_OK, t(10, 10), 15, so)[0], "ok")
+        # The market's bar for that slot is not published yet: wait, do not skip and do not trade.
+        self.assertEqual(at.market_check("spy_below_range_low", MARKET_OK[:5], t(10, 10), 15, so)[0], "wait")
+        self.assertEqual(at.market_check("spy_below_range_low", [], t(10, 10), 15, so)[0], "wait")
 
     def test_plan_refuses_a_stop_too_tight(self):
         orr = {"high": 100.0, "low": 99.9, "mid": 99.95}
@@ -354,6 +381,24 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(x, {"mfe_r": round(1.8 / 5.88, 3), "mae_r": round(0.7 / 5.88, 3), "bars": 1})
         sell = [r for r in log["orders"] if r["status"] == "filled" and r["side"] == "sell"][0]
         self.assertEqual(sell["excursion"], x)
+
+    def test_market_filter_skips_a_breakout_while_spy_is_under_its_range(self):
+        self.auto.update({"market_filter": "spy_below_range_low", "market_symbol": "SPY"})
+        broker = FakeBroker({"TSLA": TSLA, "AAPL": AAPL, "SPY": MARKET_WEAK})
+        s = self.run_day(broker, Clock(t(9, 46)), {})
+        self.assertEqual(broker.submitted, [])
+        self.assertIn("market filter", s.trades["TSLA"]["skipped"])
+        self.assertNotIn("SPY", s.trades)        # the market symbol is read, never traded
+        with open(self.paths.log) as fh:
+            self.assertIn("TSLA: SKIP (market filter", fh.read())
+
+    def test_market_filter_lets_a_breakout_through_when_spy_holds(self):
+        self.auto.update({"market_filter": "spy_below_range_low"})
+        broker = FakeBroker({"TSLA": TSLA, "AAPL": AAPL, "SPY": MARKET_OK})
+        clock = Clock(t(9, 46))
+        self.run_day(broker, clock, {t(10, 16): lambda b, s: b.fill(s.trades["TSLA"]["order_id"], 364.20),
+                                     t(11, 0): lambda b, s: b.fill(b.orders[s.trades["TSLA"]["order_id"]]["legs"][0]["id"], 370.04)})
+        self.assertEqual([x[0] for x in broker.submitted], ["TSLA"])
 
     def test_flat_by_closes_what_is_still_open(self):
         broker = FakeBroker({"TSLA": TSLA})
@@ -552,6 +597,11 @@ class SessionTest(unittest.TestCase):
             at.write_json(self.paths.config, cfg)
             with self.assertRaises(at.AutoError):
                 at.load_config(self.paths)
+        cfg = dict(self.cfg)
+        cfg["autotrader"] = {"market_filter": "spy_vibes"}
+        at.write_json(self.paths.config, cfg)
+        with self.assertRaises(at.AutoError):
+            at.load_config(self.paths)
         cfg = dict(self.cfg)
         cfg["require_stop"] = False
         at.write_json(self.paths.config, cfg)
