@@ -201,6 +201,21 @@ class JournalTest(unittest.TestCase):
         _, out, _ = run(["report", "--all", "--json"] + self.common())
         self.assertEqual(json.loads(out)["stats"]["trades"], 2)
 
+    def test_count_from_starts_the_sample_at_the_rule_change(self):
+        for d in ("2026-10-19", "2026-11-05", "2026-11-06"):
+            run(["add"] + self.common() + ["--symbol", "A", "--date", d, "--qty", "1", "--entry", "10",
+                                           "--exit", "9", "--stop", "9"])
+        with open(self.config, "w") as fh:
+            json.dump({"budget": 5000, "journal": {"cost_per_share_round_trip": 0.0, "count_from": "2026-11-06"}}, fh)
+        _, out, _ = run(["report", "--json"] + self.common())
+        doc = json.loads(out)
+        self.assertEqual(doc["stats"]["trades"], 1)
+        self.assertEqual(doc["count_from"], "2026-11-06")
+        _, out, _ = run(["report"] + self.common())
+        self.assertIn("counted from 2026-11-06", out)
+        with self.assertRaises(ValueError):
+            journal.count_from({"journal": {"count_from": "2026-11-6x"}})
+
     def test_list_with_nothing(self):
         code, out, _ = run(["list"] + self.common())
         self.assertEqual(code, 1)

@@ -192,7 +192,20 @@ def all_trades(a, cfg, paper_only):
     log_trades, still_open = trades_from_broker_log(state, cost_rt, paper_only)
     manual = trades_from_journal(read_json(a.journal, "journal", required=False), cost_rt, paper_only)
     trades = sorted(log_trades + manual, key=lambda t: (t["date"], t.get("exit_at") or "", t["symbol"]))
+    since = count_from(cfg)
+    if since:
+        trades = [t for t in trades if str(t["date"]) >= since]
     return trades, still_open, cost_rt
+
+
+def count_from(cfg):
+    """journal.count_from (YYYY-MM-DD): the day the current rule started. Trades closed under an earlier rule are
+    a different setup's sample and are not counted. Raising it only ever shrinks the sample; it is set when the
+    rule changes in writing, never to drop a bad stretch of the same rule."""
+    v = str((cfg.get("journal") or {}).get("count_from") or "").strip()
+    if v:
+        datetime.date.fromisoformat(v)    # a typo fails loudly instead of silently counting nothing
+    return v
 
 
 # ---------------------------------------------------------------- statistics
@@ -344,12 +357,14 @@ def cmd_report(a):
     v, reasons = verdict(s, gate, budget)
     label = {True: "paper", False: "live", None: "paper and live"}[paper_only]
     if a.json:
-        print(json.dumps({"scope": label, "cost_per_share_round_trip": cost_rt, "gate": gate, "stats": s,
+        print(json.dumps({"scope": label, "cost_per_share_round_trip": cost_rt, "count_from": count_from(cfg) or None,
+                          "gate": gate, "stats": s,
                           "by_symbol": by_key(trades, "symbol"), "by_setup": by_key(trades, "setup"),
                           "still_open": still_open, "verdict": v, "reasons": reasons}, indent=2))
         return 0
-    print("trader-journal: %d closed %s trade%s, net of %s a share round trip"
-          % (s["trades"], label, "" if s["trades"] == 1 else "s", _money(cost_rt).replace("$", "$")))
+    print("trader-journal: %d closed %s trade%s, net of %s a share round trip%s"
+          % (s["trades"], label, "" if s["trades"] == 1 else "s", _money(cost_rt).replace("$", "$"),
+             (", counted from %s (the current rule)" % count_from(cfg)) if count_from(cfg) else ""))
     if s["trades"]:
         print("  P&L %s total, %s a trade; %d won, %d lost, %d flat (win rate %.0f%%)"
               % (_money(s["pnl_total"]), _money(s["pnl_mean"]), s["wins"], s["losses"], s["flat"], 100 * s["win_rate"]))

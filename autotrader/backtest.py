@@ -11,7 +11,9 @@ run as its own experiment with the config's max loss per trade, daily loss, trad
 sizing; "both" runs them together under the same daily limits. A bar that touches both the stop and the
 target counts as a stop. Open at 15:55 is closed at that bar's open. Costs: the journal's
 cost_per_share_round_trip. A short on a day the stock is already down 10 % from the previous close is
-marked SSR (Reg SHO 201: a market short would not fill as planned) and not taken.
+marked SSR (Reg SHO 201: a market short would not fill as planned) and not taken. With the config's
+market_filter set, a long whose signal bar the market symbol closed under its own range low is not taken,
+exactly as the autotrader skips it (fetch then also gets the market symbol's bars).
 
 This is history, not a forecast. It says whether a rule deserves paper trades, nothing more."""
 
@@ -115,7 +117,10 @@ def walk(sb, entry_bar_t, entry, stop, target, side, flat_by):
 def candidates(bars, daily, auto, cfg, side):
     """Every signal of one side, sized by the config, with its outcome; before the daily limits."""
     out = []
+    mode, msym = auto.get("market_filter") or "", str(auto.get("market_symbol") or "SPY").upper()
     for sym, days in bars.items():
+        if sym not in auto["symbols"]:
+            continue           # the market symbol, fetched for the filter only
         for date, sb in days.items():
             day = dt.date.fromisoformat(date)
             session_open = dt.datetime.combine(day, dt.time(9, 30), tzinfo=NY)
@@ -137,6 +142,13 @@ def candidates(bars, daily, auto, cfg, side):
             rec = {"symbol": sym, "date": date, "side": side, "signal_at": at.hm(bar["t"]), "entry_at": at.hm(nxt["t"]),
                    "or_high": orr["high"], "or_low": orr["low"], "entry": round(entry, 2), "stop": round(stop, 2),
                    "strength": abs(bar["c"] - (orr["high"] if side == "long" else orr["low"])) / bar["c"]}
+            if side == "long" and mode:
+                mb = sorted(bars.get(msym, {}).get(date, []), key=lambda b: b["t"])
+                verdict, why = at.market_check(mode, mb, bar["t"], auto["or_minutes"], session_open)
+                if verdict != "ok":
+                    rec["skipped"] = "market filter" if verdict == "skip" else "market filter: no market bar"
+                    out.append(rec)
+                    continue
             pc = prev_close(daily, sym, date)
             rec["gap_pct"] = round((sb[0]["o"] - pc) / pc * 100, 3) if pc else None
             if risk <= 0:
@@ -228,9 +240,11 @@ def run(path, cfg_path, json_out):
     cfg = at.read_json(cfg_path) or {}
     auto = dict(at.DEFAULTS)
     auto.update(cfg.get("autotrader") or {})
+    auto["symbols"] = [x.upper() for x in auto["symbols"]]
     bars, daily = load(path)
     sessions = sorted({d for days in bars.values() for d in days})
-    report = {"sessions": len(sessions), "from": sessions[0], "to": sessions[-1], "symbols": sorted(bars),
+    report = {"sessions": len(sessions), "from": sessions[0], "to": sessions[-1],
+              "symbols": sorted(s for s in bars if s in auto["symbols"]), "market_filter": auto.get("market_filter") or "",
               "limits": {k: cfg.get(k) for k in ("max_loss_per_trade_usd", "max_daily_loss_usd", "max_trades_per_day", "budget")},
               "sides": {}}
     pools = {}
@@ -252,8 +266,9 @@ def run(path, cfg_path, json_out):
     if json_out:
         with open(json_out, "w") as fh:
             json.dump(report, fh, indent=1, default=str)
-    print("%d sessions %s to %s, %d symbols; limits %s" % (report["sessions"], report["from"], report["to"],
-                                                           len(report["symbols"]), report["limits"]))
+    print("%d sessions %s to %s, %d symbols; limits %s; market filter %s" % (
+        report["sessions"], report["from"], report["to"], len(report["symbols"]), report["limits"],
+        report["market_filter"] or "off"))
     for side, r in report["sides"].items():
         print("\n== %s ==" % side)
         if "signals" in r:
@@ -288,7 +303,11 @@ def main():
     auto = dict(at.DEFAULTS)
     auto.update(cfg.get("autotrader") or {})
     if a.cmd == "fetch":
-        fetch(a.days, a.out, auto["symbols"], auto["feed"])
+        syms = list(auto["symbols"])
+        msym = str(auto.get("market_symbol") or "SPY").upper()
+        if auto.get("market_filter") and msym not in syms:
+            syms.append(msym)
+        fetch(a.days, a.out, syms, auto["feed"])
     else:
         run(a.bars, a.config, a.json)
 

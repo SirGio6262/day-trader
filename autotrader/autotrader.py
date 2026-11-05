@@ -65,7 +65,14 @@ DEFAULTS = {
     "poll_seconds": 15,
     "feed": "iex",
     "max_symbols": 30,
+    # "spy_below_range_low": no long while the market symbol's signal-bar close is under its own opening-range
+    # low. Off ("") by default. Backtest 2020-07 to 2026-11, 20 symbols, 12,551 long signals: those under it
+    # averaged -0.079 R, the rest +0.039 R (day-bootstrap difference -0.118, z -2.6, same sign in all 7 years).
+    "market_filter": "",
+    "market_symbol": "SPY",
 }
+
+MARKET_FILTERS = ("", "spy_below_range_low")
 
 
 DONE = ("filled", "canceled", "expired", "rejected")   # order states that hold no shares
@@ -151,6 +158,10 @@ def load_config(paths):
         raise AutoError("require_stop is false; the autotrader needs a stop on every trade")
     if not cfg.get("max_loss_per_trade_usd") or not cfg.get("max_daily_loss_usd"):
         raise AutoError("max_loss_per_trade_usd and max_daily_loss_usd must be set")
+    auto["market_filter"] = auto.get("market_filter") or ""
+    if auto["market_filter"] not in MARKET_FILTERS:
+        raise AutoError("unknown market_filter %r; known: %s" % (auto["market_filter"], ", ".join(f for f in MARKET_FILTERS if f)))
+    auto["market_symbol"] = str(auto.get("market_symbol") or "SPY").upper()
     return cfg, auto
 
 
@@ -200,6 +211,22 @@ def breakout_bar(bars, orr, now, session_open, or_minutes, entry_from, entry_unt
         if b["c"] > orr["high"] and b["v"] >= min_volume:
             return b
     return None
+
+
+def market_check(mode, market_bars, bar_t, or_minutes, session_open):
+    """("ok" | "skip" | "wait", reason) for a long whose signal bar starts at bar_t. Read on the market symbol's
+    bar that starts at the same time, so it is known when the stock's bar completes. "wait": that bar or the
+    market's range is not there yet; the caller tries again on the next poll, and a stock bar that goes stale
+    meanwhile is not chased, as always."""
+    if not mode:
+        return "ok", None
+    orr = opening_range(market_bars, or_minutes, session_open)
+    mb = next((b for b in market_bars if b["t"] == bar_t), None)
+    if orr is None or mb is None:
+        return "wait", "no market bar for %s yet" % hm(bar_t)
+    if mode == "spy_below_range_low" and mb["c"] < orr["low"]:
+        return "skip", "market filter: the market closed %.2f at %s, below its range low %.2f" % (mb["c"], hm(bar_t), orr["low"])
+    return "ok", None
 
 
 def plan_for(bar, orr, target_r, min_stop_pct):
@@ -545,7 +572,8 @@ class Session:
         symbols = [s for s in self.auto["symbols"] if s not in self.trades]
         if not symbols:
             return
-        bars = self.b.bars(symbols, self.open, now)
+        mode, msym = self.auto.get("market_filter") or "", self.auto.get("market_symbol", "SPY")
+        bars = self.b.bars(symbols + ([msym] if mode and msym not in symbols else []), self.open, now)
         hits = []
         for sym in symbols:
             sb = bars.get(sym) or []
@@ -558,6 +586,14 @@ class Session:
                 strength = (bar["c"] - orr["high"]) / orr["high"]
                 hits.append((strength, sym, bar, orr, sb))
         for _, sym, bar, orr, sb in sorted(hits, key=lambda x: -x[0]):
+            verdict, why = market_check(mode, bars.get(msym) or [], bar["t"], self.auto["or_minutes"], self.open)
+            if verdict == "wait":
+                continue
+            if verdict == "skip":
+                self.trades[sym] = {"skipped": why, "at": ny_iso(now), "bar_time": hm(bar["t"])}
+                self.save()
+                self.say("%s: SKIP (%s)" % (sym, why), quiet=True)
+                continue
             self.try_entry(sym, bar, orr, now, self.features_for(sym, sb, bar, orr))
 
     def features_for(self, sym, sb, bar, orr):
@@ -878,9 +914,11 @@ class Session:
     # ---- the day
 
     def run(self):
-        self.say("autotrader %s: %s, %d symbols, entries %s-%s, flat by %s"
+        mf = self.auto.get("market_filter")
+        self.say("autotrader %s: %s, %d symbols, entries %s-%s, flat by %s%s"
                  % (self.date, "PAPER" if self.paper else "LIVE", len(self.auto["symbols"]), self.auto["entry_from"],
-                    self.auto["entry_until"], hm(self.flat_by)))
+                    self.auto["entry_until"], hm(self.flat_by),
+                    (", market filter %s on %s" % (mf, self.auto.get("market_symbol", "SPY"))) if mf else ""))
         self.close_leftovers(self.now_fn())
         while True:
             now = self.now_fn()
@@ -937,9 +975,10 @@ def cmd_check(a, paths):
     print("config: budget $%s, max loss/trade $%s, daily $%s, trades/day %s, %s" % (
         cfg.get("budget"), cfg["max_loss_per_trade_usd"], cfg["max_daily_loss_usd"], cfg.get("max_trades_per_day"),
         "PAPER" if paper else "LIVE"))
-    print("rule: %d symbols, range %d min, entries %s-%s, target %sR, flat by %s, feed %s" % (
+    print("rule: %d symbols, range %d min, entries %s-%s, target %sR, flat by %s, feed %s, market filter %s" % (
         len(auto["symbols"]), auto["or_minutes"], auto["entry_from"], auto["entry_until"], auto["target_r"],
-        cfg.get("flat_by", "15:55"), auto["feed"]))
+        cfg.get("flat_by", "15:55"), auto["feed"],
+        ("%s on %s" % (auto["market_filter"], auto["market_symbol"])) if auto["market_filter"] else "off"))
     b = Alpaca(paper, auto["feed"])
     acct = b.account()
     print("account: %s, cash $%.2f, equity $%.2f, buying power $%.2f" % (acct["status"], acct["cash"], acct["equity"],
